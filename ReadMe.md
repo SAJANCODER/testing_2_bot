@@ -15,7 +15,7 @@ GitSync automates daily standups by analyzing GitHub commits using Gemini AI and
 * **Frontend:** HTML5 + Chart.js (Embedded in Cliq)
 
 ## 🚀 How to Run
-1.  Clone the repoe stand_up bot, Customize.
+1.  Clone the repoe stand_up bot, Customized.
 2.  Install dependencies: `pip install -r requirements.txt`
 3.  Set up `.env` with `GOOGLE_API_KEY` and `CLIQ_WEBHOOK_URL`.
 4.  Run `python server.py`.
