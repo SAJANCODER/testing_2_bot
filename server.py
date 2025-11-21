@@ -9,13 +9,13 @@ from datetime import datetime
 # 1. Load Environment Variables
 load_dotenv()
 
-# 2. Initialize Flask App (THIS MUST BE AT THE TOP)
+# 2. Initialize Flask App
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-# ⚠️ Make sure these are set in your .env file, OR replace them with the actual strings here
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
-CLIQ_WEBHOOK_URL = os.getenv("CLIQ_WEBHOOK_URL")
+# This is the Default Channel (Fallback)
+DEFAULT_CLIQ_WEBHOOK_URL = os.getenv("CLIQ_WEBHOOK_URL")
 
 # --- SYSTEM SETUP ---
 if GOOGLE_API_KEY:
@@ -52,7 +52,7 @@ def save_to_db(author, summary):
     conn.close()
     print(f"💾 Saved entry for {author} to database.")
 
-# --- AI & CLIQ FUNCTIONS ---
+# --- AI FUNCTION ---
 def generate_standup_summary(commits):
     prompt = f"""
     You are an Agile Scrum Assistant. 
@@ -74,7 +74,15 @@ def generate_standup_summary(commits):
     except Exception as e:
         return f"Error generating AI summary: {e}"
 
-def send_to_cliq(text, author):
+# --- CLIQ SEND FUNCTION (UPDATED FOR DYNAMIC ROUTING) ---
+def send_to_cliq(text, author, target_webhook_url):
+    """
+    Sends the formatted AI summary to the SPECIFIED Zoho Cliq URL.
+    """
+    if not target_webhook_url:
+        print("❌ Error: No Webhook URL provided.")
+        return
+
     try:
         payload = {
             "text": f"### 🚀 GitSync Standup: {author}",
@@ -82,17 +90,20 @@ def send_to_cliq(text, author):
             "card": { "title": f"Daily Update: {author}", "theme": "modern-inline" },
             "slides": [ { "type": "text", "data": text } ]
         }
-        r = requests.post(CLIQ_WEBHOOK_URL, json=payload)
+        
+        # Send to the DYNAMIC URL passed to this function
+        r = requests.post(target_webhook_url, json=payload)
+        
         if r.status_code == 200 or r.status_code == 204:
-            print(f"📨 Sent to Cliq: Success (Status {r.status_code})")
+            print(f"📨 Sent to Cliq Channel: Success (Status {r.status_code})")
         else:
             print(f"❌ Cliq Error: {r.status_code} - {r.text}")
+            
     except Exception as e:
         print(f"❌ Error sending to Cliq: {e}")
 
 # --- ROUTES ---
 
-# 🏠 HOME REDIRECT (Fixes the 404 error from Zoho)
 @app.route('/', methods=['GET'])
 def home():
     print("👋 Zoho checked the root connection. Redirecting...")
@@ -101,21 +112,35 @@ def home():
 @app.route('/webhook', methods=['POST'])
 def git_webhook():
     data = request.json
-    if 'commits' in data:
+    
+    # --- 🔀 DYNAMIC ROUTING LOGIC ---
+    # Check if the URL has ?channel=NAME&token=KEY
+    dynamic_channel = request.args.get('channel')
+    dynamic_token = request.args.get('token')
+    
+    # Decide which URL to use
+    if dynamic_channel and dynamic_token:
+        print(f"🔀 Routing to Custom Team Channel: {dynamic_channel}")
+        target_url = f"https://cliq.zoho.com/api/v2/channelsbyname/{dynamic_channel}/message?zapikey={dynamic_token}"
+    else:
+        print("⬇️ Using Default Server Channel")
+        target_url = DEFAULT_CLIQ_WEBHOOK_URL
+
+    # Process the Commit
+    if data and 'commits' in data:
         author_name = data['pusher']['name']
         commit_messages = [commit['message'] for commit in data['commits']]
         full_raw_update = "\n".join(commit_messages)
 
         print(f"\n🔄 Processing commits from {author_name}...")
         
-        # 1. Generate
+        # 1. Generate AI Summary
         ai_summary = generate_standup_summary(full_raw_update)
-        print(f"🤖 GENERATED STANDUP FOR {author_name.upper()}")
-
-        # 2. Send
-        send_to_cliq(ai_summary, author_name)
         
-        # 3. Save
+        # 2. Send to the Determined Target URL
+        send_to_cliq(ai_summary, author_name, target_url)
+        
+        # 3. Save to Global Analytics DB
         save_to_db(author_name, ai_summary)
         
     return jsonify({"status": "success"}), 200
@@ -186,7 +211,9 @@ def dashboard():
     </html>
     """
     return html
+
+# 🔴 CRITICAL FOR RENDER: Initialize DB immediately when file loads
 init_db()
+
 if __name__ == '__main__':
-   
     app.run(port=5000, debug=True)
