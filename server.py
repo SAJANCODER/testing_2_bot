@@ -2,6 +2,7 @@ import google.generativeai as genai
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import os
+import requests
 load_dotenv()
 app = Flask(__name__)
 
