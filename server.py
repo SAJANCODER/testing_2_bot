@@ -2,26 +2,33 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# This is the endpoint GitHub will hit when code is committed
 @app.route('/webhook', methods=['POST'])
 def git_webhook():
-    print("🔔 Webhook Triggered!")
-    
-    # Get the JSON data sent by GitHub
     data = request.json
     
-    # For now, just print it to the console to prove it works
-    # We will add AI logic here in Phase 3
-    if data:
-        print(f"Data received from repository.")
-    
-    return jsonify({"status": "success", "message": "Webhook received"}), 200
+    # 1. Check if this is a Push event (it has 'commits')
+    if 'commits' in data:
+        # Extract simple details
+        author_name = data['pusher']['name']
+        repo_name = data['repository']['name']
+        
+        # Get all commit messages in this push
+        commit_messages = [commit['message'] for commit in data['commits']]
+        full_update = "\n".join(commit_messages)
 
-# Home route just to check if server is alive
+        print("---------------------------------")
+        print(f"👤 Author: {author_name}")
+        print(f"📂 Repo: {repo_name}")
+        print(f"📝 Updates: {full_update}")
+        print("---------------------------------")
+        
+        # TODO: Send 'full_update' to AI here later
+        
+    return jsonify({"status": "success"}), 200
+
 @app.route('/', methods=['GET'])
 def home():
     return "GitSync Bot Server is Running!"
 
 if __name__ == '__main__':
-    # Running on port 5000
     app.run(port=5000, debug=True)

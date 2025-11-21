@@ -2,7 +2,7 @@
 **Automated AI-powered Standups from Git Commits + Team Velocity Analytics**
 
 GitSync Standups converts GitHub/GitLab commits into **smart AI-generated standup updates** and posts them automatically into **Zoho Cliq channels**.  
-It also includes **blocker detection**, **PR insights**, and **team velocity dashboards**.
+It also includes **blocker detection**, **PR insights**, and **team velocity dashboards, intensive**.
 
 This project is built for the **Zoho Cliq Hackathon/Contest**.
 
