@@ -3,7 +3,38 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import os
 import requests
+import sqlite3
+from datetime import datetime
+
 load_dotenv()
+
+DB_NAME = "standups.db"
+
+def init_db():
+    """Creates the database table if it doesn't exist."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS updates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            author TEXT,
+            summary TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    print("✅ Database initialized!")
+
+def save_to_db(author, summary):
+    """Saves the standup to the database."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT INTO updates (author, summary) VALUES (?, ?)", (author, summary))
+    conn.commit()
+    conn.close()
+    print(f"💾 Saved entry for {author} to database.")
+
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
@@ -99,8 +130,12 @@ def git_webhook():
         # Step 2: Send to Zoho Cliq
         send_to_cliq(ai_summary, author_name)
         
+        # Step 3: Save to Analytics DB (NEW)
+        save_to_db(author_name, ai_summary)
+        
     return jsonify({"status": "success"}), 200
 
 if __name__ == '__main__':
+    init_db()
     # Run on standard Flask port 5000
     app.run(port=5000, debug=True)
