@@ -1,3 +1,6 @@
 /standup
 *.log
 .env
+.env
+__pycache__/
+*.db
