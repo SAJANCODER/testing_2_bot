@@ -116,15 +116,20 @@ def git_webhook():
     # --- 🔀 DYNAMIC ROUTING LOGIC ---
     # Check if the URL has ?channel=NAME&token=KEY
     # --- 🔀 DYNAMIC ROUTING LOGIC (FIXED) ---
+    # --- 🔀 DYNAMIC ROUTING LOGIC (UPDATED) ---
     dynamic_channel = request.args.get('channel')
     dynamic_token = request.args.get('token')
+    dynamic_oid = request.args.get('oid') # <--- NEW: Get the Org ID
     
     # Decide which URL to use
     if dynamic_channel and dynamic_token:
         print(f"🔀 Routing to Custom Team Channel: {dynamic_channel}")
         
-        # 🔴 FIX: Added '/company/906264961' to the URL structure
-        target_url = f"https://cliq.zoho.com/company/906264961/api/v2/channelsbyname/{dynamic_channel}/message?zapikey={dynamic_token}"
+        # Use the provided OID, or fallback to yours if missing (Safety net)
+        # Replace '906264961' below with your own ID as the default backup
+        company_id = dynamic_oid if dynamic_oid else "906264961"
+        
+        target_url = f"https://cliq.zoho.com/company/{company_id}/api/v2/channelsbyname/{dynamic_channel}/message?zapikey={dynamic_token}"
     else:
         print("⬇️ Using Default Server Channel")
         target_url = DEFAULT_CLIQ_WEBHOOK_URL
