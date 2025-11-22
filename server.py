@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 import os
 import requests
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # 1. Load Environment Variables
 load_dotenv()
@@ -14,15 +14,12 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
-# This is the Default Channel (Fallback)
 DEFAULT_CLIQ_WEBHOOK_URL = os.getenv("CLIQ_WEBHOOK_URL")
 
 # --- SYSTEM SETUP ---
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
     model = genai.GenerativeModel('gemini-2.5-pro')
-else:
-    print("❌ WARNING: GOOGLE_API_KEY not found.")
 
 # --- 📦 DATABASE SETUP ---
 DB_NAME = "standups.db"
@@ -44,29 +41,25 @@ def init_db():
     print("✅ Database initialized!")
 
 def save_to_db(author, summary):
-    """Saves the standup to the database."""
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
+    # Store pure python datetime object handling
     c.execute("INSERT INTO updates (author, summary) VALUES (?, ?)", (author, summary))
     conn.commit()
     conn.close()
     print(f"💾 Saved entry for {author} to database.")
 
-# --- AI FUNCTION ---
+# --- AI & CLIQ FUNCTIONS ---
 def generate_standup_summary(commits):
     prompt = f"""
     You are an Agile Scrum Assistant. 
     Analyze these git commit messages and convert them into a daily standup update.
-    
-    COMMITS:
-    {commits}
-    
+    COMMITS: {commits}
     OUTPUT FORMAT:
-    * **Completed:** (Summarize the work done in 1-2 clear bullet points)
-    * **Technical Context:** (Briefly mention libraries/files touched if obvious)
-    * **Potential Blockers:** (If the commits mention 'fix', 'error', or 'debug', note that a bug was resolved. Otherwise say 'None')
-    
-    Keep it concise, professional, and ready to post to a team chat.
+    * **Completed:** (Summarize work in 1-2 bullet points)
+    * **Technical Context:** (Files/Libraries touched)
+    * **Potential Blockers:** (Bugs fixed or None)
+    Keep it concise.
     """
     try:
         response = model.generate_content(prompt)
@@ -74,15 +67,8 @@ def generate_standup_summary(commits):
     except Exception as e:
         return f"Error generating AI summary: {e}"
 
-# --- CLIQ SEND FUNCTION (UPDATED FOR DYNAMIC ROUTING) ---
 def send_to_cliq(text, author, target_webhook_url):
-    """
-    Sends the formatted AI summary to the SPECIFIED Zoho Cliq URL.
-    """
-    if not target_webhook_url:
-        print("❌ Error: No Webhook URL provided.")
-        return
-
+    if not target_webhook_url: return
     try:
         payload = {
             "text": f"### 🚀 GitSync Standup: {author}",
@@ -90,83 +76,80 @@ def send_to_cliq(text, author, target_webhook_url):
             "card": { "title": f"Daily Update: {author}", "theme": "modern-inline" },
             "slides": [ { "type": "text", "data": text } ]
         }
-        
-        # Send to the DYNAMIC URL passed to this function
-        r = requests.post(target_webhook_url, json=payload)
-        
-        if r.status_code == 200 or r.status_code == 204:
-            print(f"📨 Sent to Cliq Channel: Success (Status {r.status_code})")
-        else:
-            print(f"❌ Cliq Error: {r.status_code} - {r.text}")
-            
+        requests.post(target_webhook_url, json=payload)
     except Exception as e:
         print(f"❌ Error sending to Cliq: {e}")
 
 # --- ROUTES ---
-
 @app.route('/', methods=['GET'])
 def home():
-    print("👋 Zoho checked the root connection. Redirecting...")
     return redirect('/dashboard')
 
 @app.route('/webhook', methods=['POST'])
 def git_webhook():
     data = request.json
     
-    # --- 🔀 DYNAMIC ROUTING LOGIC ---
-    # Check if the URL has ?channel=NAME&token=KEY
-    # --- 🔀 DYNAMIC ROUTING LOGIC (FIXED) ---
-    # --- 🔀 DYNAMIC ROUTING LOGIC (UPDATED) ---
+    # Dynamic Routing
     dynamic_channel = request.args.get('channel')
     dynamic_token = request.args.get('token')
-    dynamic_oid = request.args.get('oid') # <--- NEW: Get the Org ID
+    dynamic_oid = request.args.get('oid')
     
-    # Decide which URL to use
     if dynamic_channel and dynamic_token:
-        print(f"🔀 Routing to Custom Team Channel: {dynamic_channel}")
-        
-        # Use the provided OID, or fallback to yours if missing (Safety net)
-        # Replace '906264961' below with your own ID as the default backup
         company_id = dynamic_oid if dynamic_oid else "906264961"
-        
         target_url = f"https://cliq.zoho.com/company/{company_id}/api/v2/channelsbyname/{dynamic_channel}/message?zapikey={dynamic_token}"
     else:
-        print("⬇️ Using Default Server Channel")
         target_url = DEFAULT_CLIQ_WEBHOOK_URL
 
-    # Process the Commit
     if data and 'commits' in data:
         author_name = data['pusher']['name']
         commit_messages = [commit['message'] for commit in data['commits']]
         full_raw_update = "\n".join(commit_messages)
 
         print(f"\n🔄 Processing commits from {author_name}...")
-        
-        # 1. Generate AI Summary
         ai_summary = generate_standup_summary(full_raw_update)
-        
-        # 2. Send to the Determined Target URL
         send_to_cliq(ai_summary, author_name, target_url)
-        
-        # 3. Save to Global Analytics DB
         save_to_db(author_name, ai_summary)
         
     return jsonify({"status": "success"}), 200
 
+# --- 📊 ADVANCED DASHBOARD SECTION ---
 @app.route('/dashboard', methods=['GET'])
 def dashboard():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
-    # Get Recent Standups
-    c.execute("SELECT author, summary, timestamp FROM updates ORDER BY id DESC LIMIT 10")
-    recent_updates = c.fetchall()
+    # 1. Get All Data to sort in Python
+    c.execute("SELECT author, summary, timestamp FROM updates ORDER BY id DESC")
+    all_updates = c.fetchall()
     
-    # Get Stats
+    # 2. Get Chart Stats
     c.execute("SELECT author, COUNT(*) FROM updates GROUP BY author")
     stats = c.fetchall()
     conn.close()
 
+    # --- TIME SORTING LOGIC ---
+    today_logs = []
+    yesterday_logs = []
+    week_logs = []
+    
+    now = datetime.utcnow()
+    today_str = now.strftime('%Y-%m-%d')
+    yesterday_str = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+    
+    for u in all_updates:
+        # u[2] is timestamp string "2023-11-22 10:00:00"
+        db_date_str = u[2].split(' ')[0] # Get just YYYY-MM-DD
+        
+        item_html = f'<div class="update-item"><div class="meta">👤 {u[0]} | 🕒 {u[2]}</div><pre>{u[1]}</pre></div>'
+        
+        if db_date_str == today_str:
+            today_logs.append(item_html)
+        elif db_date_str == yesterday_str:
+            yesterday_logs.append(item_html)
+        else:
+            week_logs.append(item_html)
+
+    # Chart Data
     chart_labels = [row[0] for row in stats]
     chart_data = [row[1] for row in stats]
     
@@ -177,27 +160,43 @@ def dashboard():
         <title>GitSync Team Analytics</title>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
-            body {{ font-family: sans-serif; background: #f4f6f8; padding: 20px; }}
-            .container {{ max-width: 900px; margin: 0 auto; }}
-            .card {{ background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }}
-            h2 {{ color: #333; border-bottom: 2px solid #eee; padding-bottom: 10px; }}
-            .update-item {{ background: #fafafa; border-left: 4px solid #007bff; padding: 10px; margin-bottom: 10px; }}
-            .meta {{ color: #666; font-size: 0.85em; margin-bottom: 5px; font-weight: bold; }}
-            pre {{ white-space: pre-wrap; font-family: sans-serif; color: #444; margin: 0; }}
+            body {{ font-family: 'Segoe UI', sans-serif; background: #f0f2f5; padding: 20px; color: #333; }}
+            .container {{ max-width: 1000px; margin: 0 auto; }}
+            h1 {{ text-align: center; color: #2c3e50; margin-bottom: 30px; }}
+            .card {{ background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); margin-bottom: 25px; }}
+            h2 {{ font-size: 1.2em; border-bottom: 2px solid #eee; padding-bottom: 10px; margin-top: 0; color: #444; }}
+            .section-header {{ background: #e9ecef; padding: 8px 15px; border-radius: 6px; margin: 15px 0 10px; font-weight: bold; color: #555; }}
+            .update-item {{ background: #fff; border-left: 4px solid #007bff; padding: 15px; margin-bottom: 10px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+            .meta {{ color: #888; font-size: 0.85em; margin-bottom: 8px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }}
+            pre {{ white-space: pre-wrap; font-family: 'Segoe UI', sans-serif; color: #333; margin: 0; line-height: 1.5; }}
+            .empty-msg {{ color: #999; font-style: italic; padding: 10px; }}
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🚀 GitSync Analytics Dashboard</h1>
+            <h1>🚀 GitSync Analytics</h1>
+            
             <div class="card">
-                <h2>🏆 Team Velocity (Commits by Author)</h2>
-                <canvas id="activityChart" height="100"></canvas>
+                <h2>🏆 Team Velocity</h2>
+                <div style="height: 200px;">
+                    <canvas id="activityChart"></canvas>
+                </div>
             </div>
+
             <div class="card">
-                <h2>📅 Recent Standups</h2>
-                {''.join([f'<div class="update-item"><div class="meta">👤 {u[0]} | 🕒 {u[2]}</div><pre>{u[1]}</pre></div>' for u in recent_updates])}
+                <h2>📅 Activity Timeline</h2>
+                
+                <div class="section-header">🔥 Today</div>
+                { "".join(today_logs) if today_logs else "<div class='empty-msg'>No updates yet today.</div>" }
+                
+                <div class="section-header">⏪ Yesterday</div>
+                { "".join(yesterday_logs) if yesterday_logs else "<div class='empty-msg'>No updates yesterday.</div>" }
+                
+                <div class="section-header">📂 Past History</div>
+                { "".join(week_logs) if week_logs else "<div class='empty-msg'>No older history.</div>" }
             </div>
         </div>
+
         <script>
             const ctx = document.getElementById('activityChart').getContext('2d');
             new Chart(ctx, {{
@@ -205,14 +204,16 @@ def dashboard():
                 data: {{
                     labels: {chart_labels},
                     datasets: [{{
-                        label: '# of Standups',
+                        label: 'Contributions',
                         data: {chart_data},
-                        backgroundColor: 'rgba(54, 162, 235, 0.6)',
-                        borderColor: 'rgba(54, 162, 235, 1)',
-                        borderWidth: 1
+                        backgroundColor: '#36a2eb',
+                        borderRadius: 5
                     }}]
                 }},
-                options: {{ scales: {{ y: {{ beginAtZero: true }} }} }}
+                options: {{ 
+                    maintainAspectRatio: false,
+                    scales: {{ y: {{ beginAtZero: true, ticks: {{ stepSize: 1 }} }} }} 
+                }}
             }});
         </script>
     </body>
@@ -220,7 +221,7 @@ def dashboard():
     """
     return html
 
-# 🔴 CRITICAL FOR RENDER: Initialize DB immediately when file loads
+# Initialize DB immediately for Render
 init_db()
 
 if __name__ == '__main__':
