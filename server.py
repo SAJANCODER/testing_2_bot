@@ -5,6 +5,10 @@ import os
 import requests
 import sqlite3
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor # NEW: For async processing
+
+# Initialize a thread pool executor globally (Offloads slow AI tasks)
+executor = ThreadPoolExecutor(max_workers=5) 
 
 # 1. Load Environment Variables
 load_dotenv()
@@ -15,11 +19,13 @@ app = Flask(__name__)
 # --- CONFIGURATION ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
 DEFAULT_CLIQ_WEBHOOK_URL = os.getenv("CLIQ_WEBHOOK_URL")
+MODEL_NAME = 'gemini-2.5-pro' # Set to the advanced PRO model
 
 # --- SYSTEM SETUP ---
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel('gemini-2.5-pro')
+else:
+    print("❌ WARNING: GOOGLE_API_KEY not found.")
 
 # --- 📦 DATABASE SETUP ---
 DB_NAME = "standups.db"
@@ -41,20 +47,26 @@ def init_db():
     print("✅ Database initialized!")
 
 def save_to_db(author, summary):
+    """Saves the standup explicitly using UTC time."""
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # Store pure python datetime object handling
-    c.execute("INSERT INTO updates (author, summary) VALUES (?, ?)", (author, summary))
+    # 🚨 FIX: Explicitly pass datetime.utcnow() to ensure consistent UTC storage
+    c.execute("INSERT INTO updates (author, summary, timestamp) VALUES (?, ?, ?)", 
+              (author, summary, datetime.utcnow())) 
     conn.commit()
     conn.close()
     print(f"💾 Saved entry for {author} to database.")
 
 # --- AI & CLIQ FUNCTIONS ---
+
 def generate_standup_summary(commits):
+    """Generates summary using the powerful PRO model."""
     prompt = f"""
     You are an Agile Scrum Assistant. 
     Analyze these git commit messages and convert them into a daily standup update.
+    
     COMMITS: {commits}
+    
     OUTPUT FORMAT:
     * **Completed:** (Summarize work in 1-2 bullet points)
     * **Technical Context:** (Files/Libraries touched)
@@ -62,12 +74,17 @@ def generate_standup_summary(commits):
     Keep it concise.
     """
     try:
+        if not commits or len(commits.strip()) == 0:
+            return "* **Completed:** No detailed commit messages provided."
+            
+        model = genai.GenerativeModel(MODEL_NAME) # Use PRO model
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"Error generating AI summary: {e}"
+        return f"* **Completed:** Failed to generate summary due to API error. ({e})"
 
 def send_to_cliq(text, author, target_webhook_url):
+    """Sends the summary to the determined target URL."""
     if not target_webhook_url: return
     try:
         payload = {
@@ -76,11 +93,31 @@ def send_to_cliq(text, author, target_webhook_url):
             "card": { "title": f"Daily Update: {author}", "theme": "modern-inline" },
             "slides": [ { "type": "text", "data": text } ]
         }
-        requests.post(target_webhook_url, json=payload)
+        r = requests.post(target_webhook_url, json=payload)
+        
+        if r.status_code != 200 and r.status_code != 204:
+             print(f"❌ Cliq Delivery FAILED. Status: {r.status_code}. Response: {r.text}")
+        
     except Exception as e:
         print(f"❌ Error sending to Cliq: {e}")
 
+# --- ⚙️ NEW: BACKGROUND EXECUTION FUNCTION (Offloads the slow AI task) ---
+def process_standup_task(target_url, author_name, full_raw_update):
+    """Handles the slow AI generation and posting in a separate thread."""
+    
+    # 1. Generate Summary (The slow part)
+    ai_summary = generate_standup_summary(full_raw_update)
+    
+    # 2. Send to Cliq
+    send_to_cliq(ai_summary, author_name, target_url)
+    
+    # 3. Save to DB
+    save_to_db(author_name, ai_summary)
+    
+    print(f"✅ BACKGROUND TASK COMPLETE for {author_name}")
+
 # --- ROUTES ---
+
 @app.route('/', methods=['GET'])
 def home():
     return redirect('/dashboard')
@@ -95,9 +132,11 @@ def git_webhook():
     dynamic_oid = request.args.get('oid')
     
     if dynamic_channel and dynamic_token:
+        # Use provided OID, fallback to hardcoded default if not provided
         company_id = dynamic_oid if dynamic_oid else "906264961"
         target_url = f"https://cliq.zoho.com/company/{company_id}/api/v2/channelsbyname/{dynamic_channel}/message?zapikey={dynamic_token}"
     else:
+        # Fallback to default
         target_url = DEFAULT_CLIQ_WEBHOOK_URL
 
     if data and 'commits' in data:
@@ -106,11 +145,17 @@ def git_webhook():
         full_raw_update = "\n".join(commit_messages)
 
         print(f"\n🔄 Processing commits from {author_name}...")
-        ai_summary = generate_standup_summary(full_raw_update)
-        send_to_cliq(ai_summary, author_name, target_url)
-        save_to_db(author_name, ai_summary)
         
-    return jsonify({"status": "success"}), 200
+        # 🚨 CRITICAL FIX: Submit the slow work to the thread pool and return IMMEDIATELY
+        executor.submit(
+            process_standup_task,
+            target_url,
+            author_name,
+            full_raw_update
+        )
+        
+    # Must return 200 OK immediately to prevent GitHub timeout
+    return jsonify({"status": "processing_in_background", "message": "Webhook accepted"}), 200
 
 # --- 📊 ADVANCED DASHBOARD SECTION ---
 @app.route('/dashboard', methods=['GET'])
@@ -118,27 +163,25 @@ def dashboard():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
-    # 1. Get All Data to sort in Python
     c.execute("SELECT author, summary, timestamp FROM updates ORDER BY id DESC")
     all_updates = c.fetchall()
     
-    # 2. Get Chart Stats
     c.execute("SELECT author, COUNT(*) FROM updates GROUP BY author")
     stats = c.fetchall()
     conn.close()
 
     # --- TIME SORTING LOGIC ---
+    now_utc = datetime.utcnow()
+    today_str = now_utc.strftime('%Y-%m-%d')
+    yesterday_str = (now_utc - timedelta(days=1)).strftime('%Y-%m-%d')
+    
     today_logs = []
     yesterday_logs = []
     week_logs = []
     
-    now = datetime.utcnow()
-    today_str = now.strftime('%Y-%m-%d')
-    yesterday_str = (now - timedelta(days=1)).strftime('%Y-%m-%d')
-    
     for u in all_updates:
-        # u[2] is timestamp string "2023-11-22 10:00:00"
-        db_date_str = u[2].split(' ')[0] # Get just YYYY-MM-DD
+        # DB time is stored in UTC, so comparison against now_utc is accurate
+        db_date_str = u[2].split(' ')[0]
         
         item_html = f'<div class="update-item"><div class="meta">👤 {u[0]} | 🕒 {u[2]}</div><pre>{u[1]}</pre></div>'
         
@@ -175,7 +218,6 @@ def dashboard():
     <body>
         <div class="container">
             <h1>🚀 GitSync Analytics</h1>
-            
             <div class="card">
                 <h2>🏆 Team Velocity</h2>
                 <div style="height: 200px;">
@@ -185,13 +227,10 @@ def dashboard():
 
             <div class="card">
                 <h2>📅 Activity Timeline</h2>
-                
                 <div class="section-header">🔥 Today</div>
                 { "".join(today_logs) if today_logs else "<div class='empty-msg'>No updates yet today.</div>" }
-                
                 <div class="section-header">⏪ Yesterday</div>
                 { "".join(yesterday_logs) if yesterday_logs else "<div class='empty-msg'>No updates yesterday.</div>" }
-                
                 <div class="section-header">📂 Past History</div>
                 { "".join(week_logs) if week_logs else "<div class='empty-msg'>No older history.</div>" }
             </div>
