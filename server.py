@@ -10,6 +10,7 @@ import uuid
 import psycopg2
 import sys
 import html 
+import traceback
 
 # Initialize thread pool
 executor = ThreadPoolExecutor(max_workers=5) 
@@ -88,6 +89,7 @@ def save_webhook_config(chat_id, secret_key):
     if not conn: return
     try:
         c = conn.cursor()
+        # Robust UPSERT for Postgres
         c.execute("""
             INSERT INTO webhooks (secret_key, chat_id) 
             VALUES (%s, %s)
@@ -120,15 +122,22 @@ def generate_ai_analysis(commit_data, files_changed):
     commit_msg = commit_data.get('message', 'No message.')
     input_text = f"COMMIT MESSAGE: {commit_msg}\nFILES CHANGED: {', '.join(files_changed)}"
 
-    # UPDATED PROMPT: Request HTML format specifically
+    # STRICT PROMPT: Forbids list tags and asks for text bullets
     prompt = f"""
     You are an AI Code Reviewer. Analyze this commit data.
     COMMIT DATA: {input_text}
 
-    OUTPUT FORMAT (HTML ONLY, No Markdown, Use <b> for bold):
-    <b>Review Status:</b> (e.g., ✅ LGTM)
-    <b>Summary:</b> (1 sentence)
-    <b>Technical Context:</b> (List 2-3 main files)
+    INSTRUCTIONS:
+    1. Return valid HTML ONLY.
+    2. Telegram does NOT support <ul>, <ol>, or <li> tags. DO NOT USE THEM.
+    3. Use the text character "•" for bullet points.
+    4. Use <br> or newlines for line breaks.
+    5. Use <b> for bold, <i> for italic, <code> for code.
+
+    OUTPUT FORMAT:
+    <b>Review Status:</b> [Status]
+    <b>Summary:</b> [One sentence summary]
+    <b>Technical Context:</b> [List files using • bullet points]
     """
     try:
         model = genai.GenerativeModel(MODEL_NAME)
@@ -140,11 +149,28 @@ def generate_ai_analysis(commit_data, files_changed):
 def send_to_telegram(text, author, target_bot_token, target_chat_id):
     if not target_bot_token or not target_chat_id: return
     try:
-        # CLEANUP: Remove markdown code blocks and convert <br> to newlines
+        # CLEANUP: Remove markdown code blocks
         clean_text = text.replace("```html", "").replace("```", "")
+        
+        # CRITICAL FIX: Sanitize HTML for Telegram
+        # 1. Replace <br> with newlines
         clean_text = clean_text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
         
-        header = f"🚀 <b>GitSync Standup: {html.escape(author)}</b>"
+        # 2. Strip unsupported list tags if AI ignored instructions
+        clean_text = clean_text.replace("<ul>", "").replace("</ul>", "")
+        clean_text = clean_text.replace("<ol>", "").replace("</ol>", "")
+        clean_text = clean_text.replace("<li>", "• ").replace("</li>", "\n")
+        
+        # 3. Strip paragraph tags
+        clean_text = clean_text.replace("<p>", "").replace("</p>", "\n\n")
+        
+        # Time calculation for header (IST)
+        now_utc = datetime.utcnow()
+        IST_OFFSET = timedelta(hours=5, minutes=30)
+        ist_time = now_utc + IST_OFFSET
+        display_timestamp = ist_time.strftime('%Y-%m-%d %I:%M %p')
+        
+        header = f"👤 <b>{html.escape(author)}</b> | 🕒 {display_timestamp}"
         message_text = f"{header}\n\n{clean_text}"
 
         payload = {
@@ -158,26 +184,40 @@ def send_to_telegram(text, author, target_bot_token, target_chat_id):
         
         if r.status_code != 200:
              print(f"❌ Telegram Delivery FAILED. Status: {r.status_code}. Response: {r.text}")
+        else:
+             print(f"✅ Message delivered to {target_chat_id}")
     except Exception as e:
         print(f"❌ Error sending to Telegram: {e}")
 
 # --- WEBHOOK PROCESSOR ---
 def process_standup_task(target_bot_token, target_chat_id, author_name, data):
-    all_updates = []
-    for commit in data.get('commits', []):
-        files_changed = commit['added'] + commit['removed'] + commit['modified']
-        ai_response = generate_ai_analysis(commit, files_changed)
+    try:
+        all_updates = []
+        commits = data.get('commits', [])
         
-        summary = ai_response.strip()
-        all_updates.append(f"<b>Commit:</b> <code>{commit['id'][:7]}</code>\n{summary}")
-        
-        save_to_db(author_name, summary)
+        # Handle case where commits might be empty or single head_commit
+        if not commits and 'head_commit' in data:
+            commits = [data['head_commit']]
             
-    if all_updates:
-        final_report = "\n\n----------------\n\n".join(all_updates)
-        send_to_telegram(final_report, author_name, target_bot_token, target_chat_id)
-        
-    print(f"✅ BACKGROUND TASK COMPLETE for {author_name}")
+        for commit in commits:
+            # Safe get for files
+            files_changed = commit.get('added', []) + commit.get('removed', []) + commit.get('modified', [])
+            ai_response = generate_ai_analysis(commit, files_changed)
+            
+            summary = ai_response.strip()
+            commit_id = commit.get('id', 'unknown')[:7]
+            all_updates.append(f"<b>Commit:</b> <code>{commit_id}</code>\n{summary}")
+            
+            save_to_db(author_name, summary)
+                
+        if all_updates:
+            final_report = "\n\n----------------\n\n".join(all_updates)
+            send_to_telegram(final_report, author_name, target_bot_token, target_chat_id)
+            
+        print(f"✅ BACKGROUND TASK COMPLETE for {author_name}")
+    except Exception as e:
+        print(f"❌ CRITICAL TASK ERROR: {e}")
+        traceback.print_exc()
 
 # --- ROUTES ---
 
@@ -197,9 +237,13 @@ def git_webhook():
         print(f"❌ Auth Failed. URL Chat: {target_chat_id} vs DB Chat: {validated_chat_id}")
         return jsonify({"status": "error", "message": "Invalid secret_key or chat_id."}), 401 
 
-    if data and 'pusher' in data:
+    author_name = "Unknown"
+    if 'pusher' in data:
         author_name = data['pusher']['name']
-        executor.submit(process_standup_task, TELEGRAM_BOT_TOKEN_FOR_COMMANDS, target_chat_id, author_name, data)
+    elif 'sender' in data:
+        author_name = data['sender']['login']
+
+    executor.submit(process_standup_task, TELEGRAM_BOT_TOKEN_FOR_COMMANDS, target_chat_id, author_name, data)
         
     return jsonify({"status": "processing", "message": "Accepted"}), 200
 
