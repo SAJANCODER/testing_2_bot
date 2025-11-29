@@ -9,9 +9,9 @@ import re
 import uuid 
 import psycopg2
 import sys
-import html # ADDED: Required for safe HTML formatting in Telegram
+import html 
 
-# Initialize a thread pool executor globally
+# Initialize thread pool
 executor = ThreadPoolExecutor(max_workers=5) 
 
 # 1. Load Environment Variables
@@ -31,10 +31,8 @@ TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 # --- SYSTEM SETUP ---
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
-else:
-    print("❌ WARNING: GOOGLE_API_KEY not found. AI features will fail.")
 
-# --- DATABASE CONNECTION HELPER ---
+# --- DATABASE CONNECTION ---
 def get_db_connection():
     try:
         conn = psycopg2.connect(DATABASE_URL)
@@ -43,14 +41,12 @@ def get_db_connection():
         print(f"❌ DATABASE CONNECTION ERROR: {e}", file=sys.stderr)
         return None
 
-# --- DATABASE SETUP ---
+# --- DATABASE INIT ---
 def init_db():
     conn = get_db_connection()
     if not conn: return
     try:
         c = conn.cursor()
-        
-        # 1. updates (Standup Logs)
         c.execute('''
             CREATE TABLE IF NOT EXISTS updates (
                 id SERIAL PRIMARY KEY,
@@ -59,8 +55,6 @@ def init_db():
                 timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
-        # 2. webhooks (Secure Keys)
         c.execute('''
             CREATE TABLE IF NOT EXISTS webhooks (
                 secret_key TEXT PRIMARY KEY,
@@ -94,7 +88,6 @@ def save_webhook_config(chat_id, secret_key):
     if not conn: return
     try:
         c = conn.cursor()
-        # Robust UPSERT: Ensure chat_id is treated as a string to avoid type errors
         c.execute("""
             INSERT INTO webhooks (secret_key, chat_id) 
             VALUES (%s, %s)
@@ -132,10 +125,10 @@ def generate_ai_analysis(commit_data, files_changed):
     You are an AI Code Reviewer. Analyze this commit data.
     COMMIT DATA: {input_text}
 
-    OUTPUT FORMAT (HTML ONLY, No Markdown):
-    <b>Review Status:</b> (e.g., ✅ LGTM)<br>
-    <b>Summary:</b> (1 sentence)<br>
-    <b>Technical Context:</b> (List 2-3 main files)<br>
+    OUTPUT FORMAT (HTML ONLY, No Markdown, Use <b> for bold):
+    <b>Review Status:</b> (e.g., ✅ LGTM)
+    <b>Summary:</b> (1 sentence)
+    <b>Technical Context:</b> (List 2-3 main files)
     """
     try:
         model = genai.GenerativeModel(MODEL_NAME)
@@ -147,17 +140,17 @@ def generate_ai_analysis(commit_data, files_changed):
 def send_to_telegram(text, author, target_bot_token, target_chat_id):
     if not target_bot_token or not target_chat_id: return
     try:
-        # CLEANUP: Remove any markdown code blocks the AI might mistakenly include
+        # CLEANUP: Remove markdown code blocks and convert <br> to newlines
         clean_text = text.replace("```html", "").replace("```", "")
+        clean_text = clean_text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
         
-        # HTML Header
         header = f"🚀 <b>GitSync Standup: {html.escape(author)}</b>"
         message_text = f"{header}\n\n{clean_text}"
 
         payload = {
             "chat_id": target_chat_id,
             "text": message_text,
-            "parse_mode": "HTML" # CHANGED: HTML is safer than MarkdownV2
+            "parse_mode": "HTML" 
         }
         
         url = TELEGRAM_API_URL.format(token=target_bot_token)
@@ -165,16 +158,11 @@ def send_to_telegram(text, author, target_bot_token, target_chat_id):
         
         if r.status_code != 200:
              print(f"❌ Telegram Delivery FAILED. Status: {r.status_code}. Response: {r.text}")
-             if r.status_code == 400:
-                 print("⚠️ TIP: Verify the Bot is an ADMIN in the group.")
     except Exception as e:
         print(f"❌ Error sending to Telegram: {e}")
 
 # --- WEBHOOK PROCESSOR ---
 def process_standup_task(target_bot_token, target_chat_id, author_name, data):
-    # Optional: Send 'Processing' message
-    # send_to_telegram("<i>Analyzing new commits...</i>", author_name, target_bot_token, target_chat_id)
-
     all_updates = []
     for commit in data.get('commits', []):
         files_changed = commit['added'] + commit['removed'] + commit['modified']
@@ -183,7 +171,6 @@ def process_standup_task(target_bot_token, target_chat_id, author_name, data):
         summary = ai_response.strip()
         all_updates.append(f"<b>Commit:</b> <code>{commit['id'][:7]}</code>\n{summary}")
         
-        # Save to DB for Dashboard
         save_to_db(author_name, summary)
             
     if all_updates:
@@ -204,10 +191,8 @@ def git_webhook():
     secret_key = request.args.get('secret_key') 
     target_chat_id = request.args.get('chat_id') 
 
-    # Database Validation
     validated_chat_id = get_chat_id_from_secret(secret_key)
 
-    # STRICT CHECK: Key must exist AND match the Chat ID provided
     if not secret_key or not target_chat_id or str(validated_chat_id) != str(target_chat_id):
         print(f"❌ Auth Failed. URL Chat: {target_chat_id} vs DB Chat: {validated_chat_id}")
         return jsonify({"status": "error", "message": "Invalid secret_key or chat_id."}), 401 
@@ -233,20 +218,23 @@ def telegram_commands():
         if message_text.startswith('/gitsync'):
             new_key = str(uuid.uuid4())
             save_webhook_config(chat_id, new_key)
-            
             webhook_url = f"{APP_BASE_URL_USED}/webhook?secret_key={new_key}&chat_id={chat_id}"
             
-            # Reply in HTML
-            response_text = f"✅ <b>Setup Complete!</b>\n\nAdd this URL to GitHub Webhooks:\n<code>{webhook_url}</code>"
+            response_text = (
+                "👋 <b>GitSync Setup Guide</b>\n\n"
+                "1. Copy your unique Webhook URL (The token is hidden!):\n"
+                f"<code>{webhook_url}</code>\n\n"
+                "2. Paste this URL into your GitHub repository settings under Webhooks.\n"
+                "(Content Type: <code>application/json</code>, Events: <code>Just the push event</code>.)\n\n"
+                "I will now start analyzing your commits!"
+            )
             
             requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), 
                           json={"chat_id": chat_id, "text": response_text, "parse_mode": "HTML"})
             
         elif message_text.startswith('/dashboard'):
             dashboard_url = f"{APP_BASE_URL_USED}/dashboard"
-            
             response_text = f"📊 <b>Team Dashboard</b>\n\nView analytics here:\n<a href='{dashboard_url}'>Open Dashboard</a>"
-            
             requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), 
                           json={"chat_id": chat_id, "text": response_text, "parse_mode": "HTML"})
 
@@ -256,7 +244,7 @@ def telegram_commands():
 @app.route('/dashboard', methods=['GET'])
 def dashboard():
     conn = get_db_connection()
-    if not conn: return "Database Error - Check Logs", 500
+    if not conn: return "Database Error", 500
     
     try:
         c = conn.cursor()
@@ -270,19 +258,24 @@ def dashboard():
     finally:
         conn.close()
 
-    # Time sorting logic
+    # --- TIMEZONE FIX (Convert UTC to IST) ---
     now_utc = datetime.utcnow()
-    today_str = now_utc.strftime('%Y-%m-%d')
-    yesterday_str = (now_utc - timedelta(days=1)).strftime('%Y-%m-%d')
+    IST_OFFSET = timedelta(hours=5, minutes=30)
+    
+    today_str = (now_utc + IST_OFFSET).strftime('%Y-%m-%d')
+    yesterday_str = (now_utc + IST_OFFSET - timedelta(days=1)).strftime('%Y-%m-%d')
     
     today_logs = []
     yesterday_logs = []
     week_logs = []
     
     for u in all_updates:
-        # Postgres returns datetime objects
-        db_date_str = u[2].strftime('%Y-%m-%d')
-        display_timestamp = u[2].strftime('%Y-%m-%d %H:%M:%S UTC')
+        db_utc_time = u[2]
+        ist_time = db_utc_time + IST_OFFSET
+        
+        db_date_str = ist_time.strftime('%Y-%m-%d')
+        display_timestamp = ist_time.strftime('%Y-%m-%d %I:%M %p')
+        
         summary_html = u[1].replace('\n', '<br>')
             
         item_html = f'<div class="update-item"><div class="meta">👤 {u[0]} | 🕒 {display_timestamp}</div><pre>{summary_html}</pre></div>'
@@ -302,6 +295,7 @@ def dashboard():
     <html>
     <head>
         <title>GitSync Team Analytics</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
             body {{ font-family: 'Segoe UI', sans-serif; background: #f0f2f5; padding: 20px; color: #333; }}
@@ -323,7 +317,7 @@ def dashboard():
                 <div style="height: 200px;"><canvas id="activityChart"></canvas></div>
             </div>
             <div class="card">
-                <h2>📅 Activity Timeline</h2>
+                <h2>📅 Activity Timeline (IST)</h2>
                 <div class="section-header">🔥 Today</div>
                 { "".join(today_logs) if today_logs else "<div class='empty-msg'>No updates yet today.</div>" }
                 <div class="section-header">⏪ Yesterday</div>
