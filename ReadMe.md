@@ -18,4 +18,4 @@ GitSync automates daily standups by analyzing GitHub commits using Gemini AI and
 1.  Clone the repoe stand_up bot, customized.
 2.  Install dependencies: `pip install -r requirements.txt`
 3.  Set up `.env` with `GOOGLE_API_KEY` and `CLIQ_WEBHOOK_URL`.
-4.  Run `python server`.
+4.  Run `python server.py`.
