@@ -5,7 +5,8 @@ import os
 import requests
 import sqlite3
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor # NEW: For async processing
+from concurrent.futures import ThreadPoolExecutor
+import re # For cleaning/parsing AI output
 
 # Initialize a thread pool executor globally (Offloads slow AI tasks)
 executor = ThreadPoolExecutor(max_workers=5) 
@@ -18,14 +19,19 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
-DEFAULT_CLIQ_WEBHOOK_URL = os.getenv("CLIQ_WEBHOOK_URL")
-MODEL_NAME = 'gemini-2.5-pro' # Set to the advanced PRO model
+TELEGRAM_BOT_TOKEN_FOR_COMMANDS = os.getenv("TELEGRAM_BOT_TOKEN_FOR_COMMANDS")
+APP_BASE_URL = os.getenv("APP_BASE_URL")
+MODEL_NAME = 'gemini-2.5-pro' 
+TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 # --- SYSTEM SETUP ---
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
 else:
-    print("❌ WARNING: GOOGLE_API_KEY not found.")
+    print("❌ WARNING: GOOGLE_API_KEY not found. AI features will fail.")
+
+if not TELEGRAM_BOT_TOKEN_FOR_COMMANDS or not APP_BASE_URL:
+    print("❌ WARNING: TELEGRAM_BOT_TOKEN_FOR_COMMANDS or APP_BASE_URL is missing in .env. Command routes will fail.")
 
 # --- 📦 DATABASE SETUP ---
 DB_NAME = "standups.db"
@@ -50,70 +56,151 @@ def save_to_db(author, summary):
     """Saves the standup explicitly using UTC time."""
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # 🚨 FIX: Explicitly pass datetime.utcnow() to ensure consistent UTC storage
     c.execute("INSERT INTO updates (author, summary, timestamp) VALUES (?, ?, ?)", 
               (author, summary, datetime.utcnow())) 
     conn.commit()
     conn.close()
     print(f"💾 Saved entry for {author} to database.")
 
-# --- AI & CLIQ FUNCTIONS ---
+# --- HELPER FUNCTIONS ---
 
-def generate_standup_summary(commits):
-    """Generates summary using the powerful PRO model."""
+def parse_tag(text, tag_name):
+    """Simple parser to extract content between XML-style tags."""
+    start_tag = f"<{tag_name}>"
+    end_tag = f"</{tag_name}>"
+    start = text.find(start_tag)
+    end = text.find(end_tag)
+    if start != -1 and end != -1:
+        return text[start + len(start_tag):end].strip()
+    return None
+
+def escape_markdown_v2(text):
+    """Escapes special characters for Telegram's MarkdownV2 format."""
+    # Escape characters: _*[]()~`>#+-=|{}.!
+    # We escape all except *, _, which are needed for formatting, 
+    # and assume the AI output uses them correctly.
+    escape_chars = r'[]()~`>#+-=|{}.!' 
+    text = re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
+    return text
+
+def send_simple_message(token, chat_id, text):
+    """Sends a basic, unformatted text reply via Telegram."""
+    if not token or not chat_id: return
+
+    try:
+        url = TELEGRAM_API_URL.format(token=token)
+        # Using HTML parse mode for simple replies to preserve basic Markdown 
+        # without complex MarkdownV2 escaping issues for links/quotes.
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown" 
+        }
+        r = requests.post(url, json=payload)
+        
+        if r.status_code != 200:
+             print(f"❌ Telegram Reply FAILED. Status: {r.status_code}. Response: {r.text}")
+    except Exception as e:
+        print(f"❌ Error sending Telegram reply: {e}")
+
+# --- AI & TELEGRAM FUNCTIONS ---
+
+def generate_ai_analysis(commit_data, files_changed):
+    """
+    Generates a structured review and standup based on commit metadata.
+    """
+    commit_msg = commit_data.get('message', 'No message.')
+    input_text = f"COMMIT MESSAGE: {commit_msg}\nFILES CHANGED: {', '.join(files_changed)}"
+
     prompt = f"""
-    You are an Agile Scrum Assistant. 
-    Analyze these git commit messages and convert them into a daily standup update.
+    You are an AI Code Reviewer and Agile Assistant. 
+    Analyze the following commit data and generate a structured standup update.
     
-    COMMITS: {commits}
-    
+    COMMIT DATA: {input_text}
+
     OUTPUT FORMAT:
-    * **Completed:** (Summarize work in 1-2 bullet points)
-    * **Technical Context:** (Files/Libraries touched)
-    * **Potential Blockers:** (Bugs fixed or None)
-    Keep it concise.
+    
+    <STANDUP_UPDATE>
+    * **Review Status:** (e.g., ✅ LGTM, ⚠️ Needs attention, ❌ Critical Issues. Choose one based on the nature of the change.)
+    * **Summary of Work:** (1-2 bullet points explaining the feature/bug fix.)
+    * **Technical Context:** (List the main files/libraries touched.)
+    * **Potential Risks/Blockers:** (1-2 bullet points on potential issues. If none, write 'None.')
+    </STANDUP_UPDATE>
     """
     try:
-        if not commits or len(commits.strip()) == 0:
-            return "* **Completed:** No detailed commit messages provided."
-            
-        model = genai.GenerativeModel(MODEL_NAME) # Use PRO model
+        model = genai.GenerativeModel(MODEL_NAME)
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"* **Completed:** Failed to generate summary due to API error. ({e})"
+        return f"AI Analysis Failed: {e}"
 
-def send_to_cliq(text, author, target_webhook_url):
-    """Sends the summary to the determined target URL."""
-    if not target_webhook_url: return
+def send_to_telegram(text, author, target_bot_token, target_chat_id):
+    """Sends the summary to the determined Telegram chat using MarkdownV2."""
+    if not target_bot_token or not target_chat_id: 
+        print("❌ Telegram Delivery FAILED: Token or Chat ID is missing.")
+        return
     try:
-        payload = {
-            "text": f"### 🚀 GitSync Standup: {author}",
-            "bot": { "name": "GitSync Bot", "image": "https://cdn-icons-png.flaticon.com/512/4712/4712109.png" },
-            "card": { "title": f"Daily Update: {author}", "theme": "modern-inline" },
-            "slides": [ { "type": "text", "data": text } ]
-        }
-        r = requests.post(target_webhook_url, json=payload)
+        # Format for Telegram MarkdownV2
+        header = f"🚀 *GitSync Standup: {escape_markdown_v2(author)}*"
         
-        if r.status_code != 200 and r.status_code != 204:
-             print(f"❌ Cliq Delivery FAILED. Status: {r.status_code}. Response: {r.text}")
+        # Escape the summary content itself
+        escaped_summary = escape_markdown_v2(text)
+        
+        # Restore bolding/italic added by the AI (which use * and _)
+        escaped_summary = escaped_summary.replace("\\*", "*").replace("\\_", "_")
+        
+        message_text = f"{header}\n\n{escaped_summary}"
+
+        payload = {
+            "chat_id": target_chat_id,
+            "text": message_text,
+            "parse_mode": "MarkdownV2"
+        }
+        
+        url = TELEGRAM_API_URL.format(token=target_bot_token)
+        r = requests.post(url, json=payload)
+        
+        if r.status_code != 200:
+             print(f"❌ Telegram Delivery FAILED. Status: {r.status_code}. Response: {r.text}")
         
     except Exception as e:
-        print(f"❌ Error sending to Cliq: {e}")
+        print(f"❌ Error sending to Telegram: {e}")
 
-# --- ⚙️ NEW: BACKGROUND EXECUTION FUNCTION (Offloads the slow AI task) ---
-def process_standup_task(target_url, author_name, full_raw_update):
-    """Handles the slow AI generation and posting in a separate thread."""
+# --- ⚙️ BACKGROUND EXECUTION FUNCTION ---
+def process_standup_task(target_bot_token, target_chat_id, author_name, data):
+    """Handles AI analysis, posting, and saving for multiple commits."""
+    all_standup_updates = []
     
-    # 1. Generate Summary (The slow part)
-    ai_summary = generate_standup_summary(full_raw_update)
-    
-    # 2. Send to Cliq
-    send_to_cliq(ai_summary, author_name, target_url)
-    
-    # 3. Save to DB
-    save_to_db(author_name, ai_summary)
-    
+    # Iterate through all commits in the push
+    for commit in data.get('commits', []):
+        commit_id = commit['id']
+        
+        # 1. Prepare files changed list
+        files_changed = commit['added'] + commit['removed'] + commit['modified']
+        
+        # 2. Generate AI Analysis
+        ai_response = generate_ai_analysis(commit, files_changed)
+        
+        # 3. Parse the Standup Update
+        standup_summary = parse_tag(ai_response, "STANDUP_UPDATE")
+        
+        if standup_summary:
+            # Add commit details to the summary for context
+            # Use backticks for commit ID in the update
+            standup_entry = f"*Commit ID:* `{commit_id[:7]}`\n\n{standup_summary}"
+            all_standup_updates.append(standup_entry)
+            
+            # 4. Save to DB
+            save_to_db(author_name, standup_summary)
+        else:
+            print(f"Skipping commit {commit_id}: Failed to parse AI STANDUP_UPDATE.")
+            
+    # 5. Send all aggregated summaries to Telegram
+    if all_standup_updates:
+        # Aggregate all updates into one report for Telegram
+        full_report = f"Daily Report for *{author_name}* (Total {len(all_standup_updates)} Commits):\n\n" + "\n---\n".join(all_standup_updates)
+        send_to_telegram(full_report, author_name, target_bot_token, target_chat_id)
+        
     print(f"✅ BACKGROUND TASK COMPLETE for {author_name}")
 
 # --- ROUTES ---
@@ -124,40 +211,90 @@ def home():
 
 @app.route('/webhook', methods=['POST'])
 def git_webhook():
+    """Handles POST requests from GitHub webhooks."""
     data = request.json
     
-    # Dynamic Routing
-    dynamic_channel = request.args.get('channel')
-    dynamic_token = request.args.get('token')
-    dynamic_oid = request.args.get('oid')
-    
-    if dynamic_channel and dynamic_token:
-        # Use provided OID, fallback to hardcoded default if not provided
-        company_id = dynamic_oid if dynamic_oid else "906264961"
-        target_url = f"https://cliq.zoho.com/company/{company_id}/api/v2/channelsbyname/{dynamic_channel}/message?zapikey={dynamic_token}"
-    else:
-        # Fallback to default
-        target_url = DEFAULT_CLIQ_WEBHOOK_URL
+    # Dynamic Routing for Telegram
+    target_bot_token = request.args.get('token')
+    target_chat_id = request.args.get('chat_id')
 
-    if data and 'commits' in data:
+    # Ensure required parameters are present for Telegram
+    if not target_bot_token or not target_chat_id:
+        return jsonify({
+            "status": "error", 
+            "message": "Missing 'token' or 'chat_id' query parameters for Telegram integration. Please check your GitHub webhook URL setup."
+        }), 400
+
+    if data and 'pusher' in data and 'commits' in data:
         author_name = data['pusher']['name']
-        commit_messages = [commit['message'] for commit in data['commits']]
-        full_raw_update = "\n".join(commit_messages)
 
-        print(f"\n🔄 Processing commits from {author_name}...")
+        print(f"\n🔄 Processing {len(data['commits'])} commits from {author_name}...")
         
-        # 🚨 CRITICAL FIX: Submit the slow work to the thread pool and return IMMEDIATELY
+        # Submit the slow work to the thread pool and return IMMEDIATELY
         executor.submit(
             process_standup_task,
-            target_url,
+            target_bot_token,
+            target_chat_id,
             author_name,
-            full_raw_update
+            data
         )
         
     # Must return 200 OK immediately to prevent GitHub timeout
-    return jsonify({"status": "processing_in_background", "message": "Webhook accepted"}), 200
+    return jsonify({"status": "processing_in_background", "message": "Webhook accepted by Telegram processor"}), 200
 
-# --- 📊 ADVANCED DASHBOARD SECTION ---
+@app.route('/telegram_commands', methods=['POST'])
+def telegram_commands():
+    """Handles commands like /gitsync and /dashboard sent via the Telegram Bot API."""
+    update = request.json
+    
+    BOT_TOKEN = TELEGRAM_BOT_TOKEN_FOR_COMMANDS
+    APP_BASE_URL_USED = APP_BASE_URL # Use the configured variable
+
+    if not BOT_TOKEN or not APP_BASE_URL_USED:
+        print("Telegram command handler is not configured correctly.")
+        return jsonify({"status": "error", "message": "Bot not configured"}), 500
+
+
+    if 'message' in update:
+        message = update['message']
+        message_text = message.get('text', '')
+        chat_id = message['chat']['id']
+        
+        if message_text.startswith('/gitsync'):
+            
+            webhook_url = f"{APP_BASE_URL_USED}/webhook?token={BOT_TOKEN}&chat_id={chat_id}"
+            
+            response_text = f"""
+👋 **GitSync Setup Guide**
+
+*1. Copy your unique Webhook URL:*
+`{webhook_url}`
+
+*2. Paste this URL into your GitHub repository settings under Webhooks.*
+(Content Type: `application/json`, Events: `Just the push event`.)
+
+I will now start analyzing your commits!
+"""
+            send_simple_message(BOT_TOKEN, chat_id, response_text)
+            
+        elif message_text.startswith('/dashboard'):
+            
+            dashboard_url = f"{APP_BASE_URL_USED}/dashboard"
+            
+            response_text = f"""
+📊 **GitSync Team Analytics Dashboard**
+
+View the historical performance and standup log for the entire team here:
+[Open Dashboard]({dashboard_url})
+
+_Note: This is a public URL. Please share responsibly._
+"""
+            send_simple_message(BOT_TOKEN, chat_id, response_text)
+
+    return jsonify({"status": "ok"}), 200
+
+
+# --- 📊 ADVANCED DASHBOARD SECTION (Remains the same) ---
 @app.route('/dashboard', methods=['GET'])
 def dashboard():
     conn = sqlite3.connect(DB_NAME)
@@ -180,10 +317,14 @@ def dashboard():
     week_logs = []
     
     for u in all_updates:
-        # DB time is stored in UTC, so comparison against now_utc is accurate
-        db_date_str = u[2].split(' ')[0]
-        
-        item_html = f'<div class="update-item"><div class="meta">👤 {u[0]} | 🕒 {u[2]}</div><pre>{u[1]}</pre></div>'
+        try:
+            db_date_str = u[2].split(' ')[0]
+        except:
+            db_date_str = ""
+            
+        summary_html = u[1].replace('\n', '<br>')
+            
+        item_html = f'<div class="update-item"><div class="meta">👤 {u[0]} | 🕒 {u[2]}</div><pre>{summary_html}</pre></div>'
         
         if db_date_str == today_str:
             today_logs.append(item_html)
@@ -260,7 +401,7 @@ def dashboard():
     """
     return html
 
-# Initialize DB immediately for Render
+# Initialize DB immediately
 init_db()
 
 if __name__ == '__main__':
