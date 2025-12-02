@@ -49,7 +49,7 @@ def init_db():
     try:
         c = conn.cursor()
         
-        # 1. Create table if it doesn't exist
+        # 1. Create base table
         c.execute('''
             CREATE TABLE IF NOT EXISTS project_updates (
                 id SERIAL PRIMARY KEY,
@@ -63,11 +63,14 @@ def init_db():
             )
         ''')
 
-        # 2. AUTO-MIGRATION: Add columns if they don't exist (for existing users)
+        # 2. AUTO-MIGRATION: Add new columns if they don't exist
+        # This allows the bot to upgrade existing databases without losing data
         try:
             c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS repo_name TEXT;")
             c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS branch_name TEXT;")
-            c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS files_changed INTEGER DEFAULT 0;")
+            c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS files_added INTEGER DEFAULT 0;")
+            c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS files_modified INTEGER DEFAULT 0;")
+            c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS files_removed INTEGER DEFAULT 0;")
         except Exception as e:
             print(f"⚠️ Migration notice: {e}")
 
@@ -87,15 +90,19 @@ def init_db():
         conn.close()
 
 # --- DATABASE OPERATIONS ---
-def save_to_db(chat_id, author, repo_name, branch_name, summary, files_count):
+def save_to_db(chat_id, author, repo_name, branch_name, summary, added, modified, removed):
     conn = get_db_connection()
     if not conn: return
     try:
         c = conn.cursor()
+        # Calculate total files changed for legacy compatibility
+        total_files = added + modified + removed
+        
         c.execute("""
-            INSERT INTO project_updates (chat_id, author, repo_name, branch_name, summary, files_changed, timestamp) 
-            VALUES (%s, %s, %s, %s, %s, %s, NOW())
-        """, (str(chat_id), author, repo_name, branch_name, summary, files_count)) 
+            INSERT INTO project_updates 
+            (chat_id, author, repo_name, branch_name, summary, files_changed, files_added, files_modified, files_removed, timestamp) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        """, (str(chat_id), author, repo_name, branch_name, summary, total_files, added, modified, removed)) 
         conn.commit()
     except Exception as e:
         print(f"❌ Error saving to updates table: {e}")
@@ -179,6 +186,7 @@ def generate_ai_analysis(commit_data, files_changed):
 def send_to_telegram(text, author, repo, branch, target_bot_token, target_chat_id):
     if not target_bot_token or not target_chat_id: return
     try:
+        # CLEANUP
         clean_text = text.replace("```html", "").replace("```", "")
         clean_text = clean_text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
         clean_text = clean_text.replace("<ul>", "").replace("</ul>", "")
@@ -191,6 +199,7 @@ def send_to_telegram(text, author, repo, branch, target_bot_token, target_chat_i
         ist_time = now_utc + IST_OFFSET
         display_timestamp = ist_time.strftime('%I:%M %p')
         
+        # Header with Repo and Branch
         header = (
             f"👤 <b>{html.escape(author)}</b>\n"
             f"📂 <b>{html.escape(repo)}</b> (<code>{html.escape(branch)}</code>)\n"
@@ -218,14 +227,11 @@ def process_standup_task(target_bot_token, target_chat_id, author_name, data):
         all_updates = []
         commits = data.get('commits', [])
         
-        # EXTRACT REPO INFO
         repo_name = data.get('repository', {}).get('name', 'Unknown Repo')
         org_name = data.get('repository', {}).get('organization', 'Unknown Org')
         if isinstance(org_name, dict): org_name = org_name.get('login', 'Unknown')
         
-        # Use Org name if available, otherwise Repo Name
         display_repo_name = f"{org_name}/{repo_name}" if org_name != 'Unknown' and org_name != 'Unknown Org' else repo_name
-
         branch_ref = data.get('ref', '')
         branch_name = branch_ref.split('/')[-1] if branch_ref else 'unknown'
 
@@ -233,21 +239,24 @@ def process_standup_task(target_bot_token, target_chat_id, author_name, data):
             commits = [data['head_commit']]
             
         for commit in commits:
-            # CALCULATE IMPACT (Total files touched)
-            added = commit.get('added', [])
-            removed = commit.get('removed', [])
-            modified = commit.get('modified', [])
-            files_list = added + removed + modified
-            impact_score = len(files_list)
-
+            # CALCULATE FILE STATS
+            added_list = commit.get('added', [])
+            removed_list = commit.get('removed', [])
+            modified_list = commit.get('modified', [])
+            
+            added_count = len(added_list)
+            removed_count = len(removed_list)
+            modified_count = len(modified_list)
+            
+            files_list = added_list + removed_list + modified_list
             ai_response = generate_ai_analysis(commit, files_list)
             
             summary = ai_response.strip()
             commit_id = commit.get('id', 'unknown')[:7]
             all_updates.append(f"<b>Commit:</b> <code>{commit_id}</code>\n{summary}")
             
-            # Save to DB with Impact Score
-            save_to_db(target_chat_id, author_name, display_repo_name, branch_name, summary, impact_score)
+            # Save detailed stats to DB
+            save_to_db(target_chat_id, author_name, display_repo_name, branch_name, summary, added_count, modified_count, removed_count)
                 
         if all_updates:
             final_report = "\n\n----------------\n\n".join(all_updates)
@@ -301,9 +310,7 @@ def telegram_commands():
         if message_text.startswith('/start'):
             guide_text = (
                 "👋 <b>Welcome to GitSync!</b>\n\n"
-                "Add me to your Telegram organization group, to instantly generate a unique webhook for your team.\n\n"
-                "I’ll handle everything automatically — just drop me in, and your dashboard comes alive.\n\n"
-                "Tap → Add(User_Name:<code>@GitSynBot</code>) → Done.\n\n"
+                "Add me to your Telegram organization group so I can generate a unique webhook for your team.\n\n"
                 "Once added, run:\n"
                 "🔹 <code>/gitsync</code> to get your webhook URL\n"
                 "🔹 <code>/dashboard</code> to see your team's analytics"
@@ -318,12 +325,10 @@ def telegram_commands():
             
             response_text = (
                 "👋 <b>GitSync Setup Guide</b>\n\n"
-                "1. Copy your unique Webhook URL (The token is hidden!):\n\n"
+                "1. Copy your unique Webhook URL (The token is hidden!):\n"
                 f"<code>{webhook_url}</code>\n\n"
-                "2. Paste this URL into your GitHub repository (settings), under (Webhooks).\n"
+                "2. Paste this URL into your GitHub repository settings under Webhooks.\n"
                 "(Content Type: <code>application/json</code>, Events: <code>Just the push event</code>.)\n\n"
-                "Once added, run:\n"
-                "🔹 <code>/dashboard</code> to see your team's analytics\n\n"
                 "I will now start analyzing your commits!"
             )
             requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), 
@@ -359,7 +364,7 @@ def dashboard():
     try:
         c = conn.cursor()
         
-        # Fetch logs for list
+        # 1. Fetch Commit History
         c.execute("""
             SELECT author, summary, timestamp, repo_name, branch_name 
             FROM project_updates 
@@ -368,16 +373,20 @@ def dashboard():
         """, (str(target_chat_id),))
         all_updates = c.fetchall()
         
-        # Fetch Stats: Sum of files_changed per author (Impact Score)
+        # 2. Fetch Stats (Grouped by author, summing up file changes)
+        # We coalesce nulls to 0 to handle legacy rows
         c.execute("""
-            SELECT author, SUM(files_changed) 
+            SELECT author, 
+                   SUM(COALESCE(files_added, 0)) as added,
+                   SUM(COALESCE(files_modified, 0)) as modified,
+                   SUM(COALESCE(files_removed, 0)) as removed
             FROM project_updates 
             WHERE chat_id = %s 
             GROUP BY author
         """, (str(target_chat_id),))
         stats = c.fetchall()
         
-        # Fetch Organization/Repo Name for Header
+        # 3. Fetch Organization Name (Most recent)
         c.execute("SELECT repo_name FROM project_updates WHERE chat_id = %s ORDER BY id DESC LIMIT 1", (str(target_chat_id),))
         repo_result = c.fetchone()
         org_title = repo_result[0] if repo_result and repo_result[0] else "Organization"
@@ -387,7 +396,7 @@ def dashboard():
     finally:
         conn.close()
 
-    # Time sorting logic (IST)
+    # Time sorting
     now_utc = datetime.utcnow()
     IST_OFFSET = timedelta(hours=5, minutes=30)
     today_str = (now_utc + IST_OFFSET).strftime('%Y-%m-%d')
@@ -401,10 +410,8 @@ def dashboard():
         db_date_str = ist_time.strftime('%Y-%m-%d')
         display_timestamp = ist_time.strftime('%I:%M %p')
         
-        # Default values for old rows without repo/branch
         repo = u[3] if len(u) > 3 and u[3] else "Unknown"
         branch = u[4] if len(u) > 4 and u[4] else "main"
-        
         summary_html = u[1].replace('\n', '<br>')
             
         item_html = (
@@ -421,10 +428,18 @@ def dashboard():
         elif db_date_str == yesterday_str: yesterday_logs.append(item_html)
         else: week_logs.append(item_html)
 
-    # Chart Data: Use impact score (SUM of files) instead of count
-    chart_labels = [row[0] for row in stats]
-    chart_data = [row[1] for row in stats]
+    # Prepare Chart Data
+    labels = []
+    data_added = []
+    data_modified = []
+    data_removed = []
     
+    for row in stats:
+        labels.append(row[0])       # Author
+        data_added.append(row[1])   # Added
+        data_modified.append(row[2])# Modified
+        data_removed.append(row[3]) # Removed
+
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -448,11 +463,11 @@ def dashboard():
     <body>
         <div class="container">
             <h1>🚀 GitSync Analytics</h1>
-            <div class="subtitle">Active Repo: <b>{org_title}</b></div>
+            <div class="subtitle">Organization/Repo: <b>{org_title}</b></div>
             
             <div class="card">
-                <h2>🏆 Team Velocity (Files Changed)</h2>
-                <div style="height: 250px;"><canvas id="activityChart"></canvas></div>
+                <h2>🏆 Team Impact (Files Touched)</h2>
+                <div style="height: 300px;"><canvas id="activityChart"></canvas></div>
             </div>
             <div class="card">
                 <h2>📅 Activity Timeline (IST)</h2>
@@ -469,17 +484,24 @@ def dashboard():
             new Chart(ctx, {{
                 type: 'bar',
                 data: {{ 
-                    labels: {chart_labels}, 
-                    datasets: [{{ 
-                        label: 'Impact Score (Files Changed)', 
-                        data: {chart_data}, 
-                        backgroundColor: '#36a2eb', 
-                        borderRadius: 5 
-                    }}] 
+                    labels: {labels}, 
+                    datasets: [
+                        {{ label: 'Added', data: {data_added}, backgroundColor: '#2ecc71' }},
+                        {{ label: 'Modified', data: {data_modified}, backgroundColor: '#f1c40f' }},
+                        {{ label: 'Deleted', data: {data_removed}, backgroundColor: '#e74c3c' }}
+                    ] 
                 }},
                 options: {{ 
-                    maintainAspectRatio: false, 
-                    scales: {{ y: {{ beginAtZero: true, ticks: {{ stepSize: 1 }} }} }} 
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {{ 
+                        x: {{ stacked: true }},
+                        y: {{ stacked: true, beginAtZero: true, ticks: {{ stepSize: 1 }} }} 
+                    }},
+                    plugins: {{
+                        legend: {{ position: 'top' }},
+                        tooltip: {{ mode: 'index', intersect: false }}
+                    }}
                 }}
             }});
         </script>
