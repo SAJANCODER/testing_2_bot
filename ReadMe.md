@@ -83,6 +83,7 @@ It listens for GitHub push events, uses **Google Gemini 2.5 Pro** to analyze cod
 
 - `/gitsync`: Generates a new secure webhook link for the current group.
 - `/dashboard`: Returns a link to the public analytics dashboard showing commit history and team stats.
+- `/start`: Guides you to operate the bot.
 
 ---
 
