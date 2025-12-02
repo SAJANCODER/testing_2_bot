@@ -48,14 +48,18 @@ def init_db():
     if not conn: return
     try:
         c = conn.cursor()
+        # 1. project_updates (Renamed to force fresh creation with chat_id)
         c.execute('''
-            CREATE TABLE IF NOT EXISTS updates (
+            CREATE TABLE IF NOT EXISTS project_updates (
                 id SERIAL PRIMARY KEY,
+                chat_id TEXT NOT NULL,
                 author TEXT,
                 summary TEXT,
                 timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        
+        # 2. webhooks (Secure Keys)
         c.execute('''
             CREATE TABLE IF NOT EXISTS webhooks (
                 secret_key TEXT PRIMARY KEY,
@@ -71,13 +75,13 @@ def init_db():
         conn.close()
 
 # --- DATABASE OPERATIONS ---
-def save_to_db(author, summary):
+def save_to_db(chat_id, author, summary):
     conn = get_db_connection()
     if not conn: return
     try:
         c = conn.cursor()
-        c.execute("INSERT INTO updates (author, summary, timestamp) VALUES (%s, %s, NOW())", 
-                  (author, summary)) 
+        c.execute("INSERT INTO project_updates (chat_id, author, summary, timestamp) VALUES (%s, %s, %s, NOW())", 
+                  (str(chat_id), author, summary)) 
         conn.commit()
     except Exception as e:
         print(f"❌ Error saving to updates table: {e}")
@@ -89,7 +93,6 @@ def save_webhook_config(chat_id, secret_key):
     if not conn: return
     try:
         c = conn.cursor()
-        # Robust UPSERT for Postgres
         c.execute("""
             INSERT INTO webhooks (secret_key, chat_id) 
             VALUES (%s, %s)
@@ -117,12 +120,25 @@ def get_chat_id_from_secret(secret_key):
     finally:
         conn.close()
 
+def get_secret_from_chat_id(chat_id):
+    conn = get_db_connection()
+    if not conn: return None
+    try:
+        c = conn.cursor()
+        c.execute("SELECT secret_key FROM webhooks WHERE chat_id = %s", (str(chat_id),))
+        result = c.fetchone()
+        return result[0] if result else None
+    except Exception as e:
+        print(f"❌ Error retrieving secret key: {e}")
+        return None
+    finally:
+        conn.close()
+
 # --- AI & TELEGRAM FUNCTIONS ---
 def generate_ai_analysis(commit_data, files_changed):
     commit_msg = commit_data.get('message', 'No message.')
     input_text = f"COMMIT MESSAGE: {commit_msg}\nFILES CHANGED: {', '.join(files_changed)}"
 
-    # STRICT PROMPT: Forbids list tags and asks for text bullets
     prompt = f"""
     You are an AI Code Reviewer. Analyze this commit data.
     COMMIT DATA: {input_text}
@@ -149,22 +165,13 @@ def generate_ai_analysis(commit_data, files_changed):
 def send_to_telegram(text, author, target_bot_token, target_chat_id):
     if not target_bot_token or not target_chat_id: return
     try:
-        # CLEANUP: Remove markdown code blocks
         clean_text = text.replace("```html", "").replace("```", "")
-        
-        # CRITICAL FIX: Sanitize HTML for Telegram
-        # 1. Replace <br> with newlines
         clean_text = clean_text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-        
-        # 2. Strip unsupported list tags if AI ignored instructions
         clean_text = clean_text.replace("<ul>", "").replace("</ul>", "")
         clean_text = clean_text.replace("<ol>", "").replace("</ol>", "")
         clean_text = clean_text.replace("<li>", "• ").replace("</li>", "\n")
-        
-        # 3. Strip paragraph tags
         clean_text = clean_text.replace("<p>", "").replace("</p>", "\n\n")
         
-        # Time calculation for header (IST)
         now_utc = datetime.utcnow()
         IST_OFFSET = timedelta(hours=5, minutes=30)
         ist_time = now_utc + IST_OFFSET
@@ -184,8 +191,6 @@ def send_to_telegram(text, author, target_bot_token, target_chat_id):
         
         if r.status_code != 200:
              print(f"❌ Telegram Delivery FAILED. Status: {r.status_code}. Response: {r.text}")
-        else:
-             print(f"✅ Message delivered to {target_chat_id}")
     except Exception as e:
         print(f"❌ Error sending to Telegram: {e}")
 
@@ -195,12 +200,10 @@ def process_standup_task(target_bot_token, target_chat_id, author_name, data):
         all_updates = []
         commits = data.get('commits', [])
         
-        # Handle case where commits might be empty or single head_commit
         if not commits and 'head_commit' in data:
             commits = [data['head_commit']]
             
         for commit in commits:
-            # Safe get for files
             files_changed = commit.get('added', []) + commit.get('removed', []) + commit.get('modified', [])
             ai_response = generate_ai_analysis(commit, files_changed)
             
@@ -208,7 +211,8 @@ def process_standup_task(target_bot_token, target_chat_id, author_name, data):
             commit_id = commit.get('id', 'unknown')[:7]
             all_updates.append(f"<b>Commit:</b> <code>{commit_id}</code>\n{summary}")
             
-            save_to_db(author_name, summary)
+            # Save to DB with Chat ID for Personalized Dashboard
+            save_to_db(target_chat_id, author_name, summary)
                 
         if all_updates:
             final_report = "\n\n----------------\n\n".join(all_updates)
@@ -223,7 +227,7 @@ def process_standup_task(target_bot_token, target_chat_id, author_name, data):
 
 @app.route('/', methods=['GET'])
 def home():
-    return redirect('/dashboard')
+    return "GitSync Bot Active"
 
 @app.route('/webhook', methods=['POST'])
 def git_webhook():
@@ -259,19 +263,16 @@ def telegram_commands():
         message_text = message.get('text', '')
         chat_id = message['chat']['id']
         
-        # --- MODIFICATION START: /start command handler ---
         if message_text.startswith('/start'):
             guide_text = (
                 "👋 <b>Welcome to GitSync!</b>\n\n"
-                "Add me to your Telegram organization group so that I can generate a webhook according to your organization, "
-                "and I can guide you further.\n\n"
-                "After adding me in your Telegram group, just provide:\n"
-                "🔹 <code>/gitsync</code> to get your unique webhook URL\n"
-                "🔹 <code>/dashboard</code> for tracking performance"
+                "Add me to your Telegram organization group so I can generate a unique webhook for your team.\n\n"
+                "Once added, run:\n"
+                "🔹 <code>/gitsync</code> to get your webhook URL\n"
+                "🔹 <code>/dashboard</code> to see your team's analytics"
             )
             requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), 
                           json={"chat_id": chat_id, "text": guide_text, "parse_mode": "HTML"})
-        # --- MODIFICATION END ---
 
         elif message_text.startswith('/gitsync'):
             new_key = str(uuid.uuid4())
@@ -286,37 +287,53 @@ def telegram_commands():
                 "(Content Type: <code>application/json</code>, Events: <code>Just the push event</code>.)\n\n"
                 "I will now start analyzing your commits!"
             )
-            
             requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), 
                           json={"chat_id": chat_id, "text": response_text, "parse_mode": "HTML"})
             
         elif message_text.startswith('/dashboard'):
-            dashboard_url = f"{APP_BASE_URL_USED}/dashboard"
-            response_text = f"📊 <b>Team Dashboard</b>\n\nView analytics here:\n<a href='{dashboard_url}'>Open Dashboard</a>"
+            # Retrieve the key associated with this chat to create a secure link
+            key = get_secret_from_chat_id(chat_id)
+            if key:
+                dashboard_url = f"{APP_BASE_URL}/dashboard?key={key}"
+                response_text = f"📊 <b>Team Dashboard</b>\n\nView your team's specific analytics here:\n<a href='{dashboard_url}'>Open Dashboard</a>"
+            else:
+                response_text = "❌ <b>Error:</b> Please run <code>/gitsync</code> first to set up your group."
+
             requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), 
                           json={"chat_id": chat_id, "text": response_text, "parse_mode": "HTML"})
 
     return jsonify({"status": "ok"}), 200
 
-# --- 📊 DASHBOARD ROUTE ---
+# --- 📊 PERSONALIZED DASHBOARD ROUTE ---
 @app.route('/dashboard', methods=['GET'])
 def dashboard():
+    # Security: Require the secret key to show data
+    secret_key = request.args.get('key')
+    if not secret_key:
+        return "<h1>401 Unauthorized</h1><p>Access denied. Please use the link provided by the bot.</p>", 401
+        
+    # Get Chat ID from Key
+    target_chat_id = get_chat_id_from_secret(secret_key)
+    if not target_chat_id:
+        return "<h1>401 Unauthorized</h1><p>Invalid dashboard key.</p>", 401
+
     conn = get_db_connection()
     if not conn: return "Database Error", 500
     
     try:
         c = conn.cursor()
-        c.execute("SELECT author, summary, timestamp FROM updates ORDER BY id DESC")
+        # Filter by CHAT_ID to show only this group's data
+        c.execute("SELECT author, summary, timestamp FROM project_updates WHERE chat_id = %s ORDER BY id DESC", (str(target_chat_id),))
         all_updates = c.fetchall()
         
-        c.execute("SELECT author, COUNT(*) FROM updates GROUP BY author")
+        c.execute("SELECT author, COUNT(*) FROM project_updates WHERE chat_id = %s GROUP BY author", (str(target_chat_id),))
         stats = c.fetchall()
     except Exception as e:
         return f"Query Error: {e}", 500
     finally:
         conn.close()
 
-    # --- TIMEZONE FIX (Convert UTC to IST) ---
+    # Time sorting logic (IST)
     now_utc = datetime.utcnow()
     IST_OFFSET = timedelta(hours=5, minutes=30)
     
@@ -333,7 +350,6 @@ def dashboard():
         
         db_date_str = ist_time.strftime('%Y-%m-%d')
         display_timestamp = ist_time.strftime('%Y-%m-%d %I:%M %p')
-        
         summary_html = u[1].replace('\n', '<br>')
             
         item_html = f'<div class="update-item"><div class="meta">👤 {u[0]} | 🕒 {display_timestamp}</div><pre>{summary_html}</pre></div>'
@@ -369,7 +385,7 @@ def dashboard():
     </head>
     <body>
         <div class="container">
-            <h1>🚀 GitSync Analytics</h1>
+            <h1>🚀 GitSync Analytics (Private Group)</h1>
             <div class="card">
                 <h2>🏆 Team Velocity</h2>
                 <div style="height: 200px;"><canvas id="activityChart"></canvas></div>
