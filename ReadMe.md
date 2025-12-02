@@ -93,7 +93,7 @@ It listens for GitHub push events, uses **Google Gemini 2.5 Pro** to analyze cod
 ├── server.py           # Main application logic (Flask + AI + DB)
 ├── requirements.txt    # Python dependencies
 ├── Procfile            # Gunicorn startup configuration
-└── README.md           # Project documentation
+└── README.md           #  documentation
 ```
 
 ---
