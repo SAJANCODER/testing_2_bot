@@ -259,7 +259,21 @@ def telegram_commands():
         message_text = message.get('text', '')
         chat_id = message['chat']['id']
         
-        if message_text.startswith('/gitsync'):
+        # --- MODIFICATION START: /start command handler ---
+        if message_text.startswith('/start'):
+            guide_text = (
+                "👋 <b>Welcome to GitSync!</b>\n\n"
+                "Add me to your Telegram organization group so that I can generate a webhook according to your organization, "
+                "and I can guide you further.\n\n"
+                "After adding me in your Telegram group, just provide:\n"
+                "🔹 <code>/gitsync</code> to get your unique webhook URL\n"
+                "🔹 <code>/dashboard</code> for tracking performance"
+            )
+            requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), 
+                          json={"chat_id": chat_id, "text": guide_text, "parse_mode": "HTML"})
+        # --- MODIFICATION END ---
+
+        elif message_text.startswith('/gitsync'):
             new_key = str(uuid.uuid4())
             save_webhook_config(chat_id, new_key)
             webhook_url = f"{APP_BASE_URL_USED}/webhook?secret_key={new_key}&chat_id={chat_id}"
