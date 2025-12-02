@@ -322,7 +322,7 @@ def telegram_commands():
             key = get_secret_from_chat_id(chat_id)
             if key:
                 dashboard_url = f"{APP_BASE_URL}/dashboard?key={key}"
-                response_text = f"📊 <b>Team Dashboard</b>\n\nView your team's specific analytics here:\n<a href='{dashboard_url}'>Open Dashboard</a>"
+                response_text = f"📊 <b>Team Dashboard</b>\n\nUnlock Your Team's Hidden Insights\nDiscover real-time performance metrics, collaboration trends, and growth opportunities tailored just for your team. Why wait? Dive in now and turn data into decisions that drive results: \n<a href='{dashboard_url}'>Open Dashboard</a>"
             else:
                 response_text = "❌ <b>Error:</b> Please run <code>/gitsync</code> first to set up your group."
 
