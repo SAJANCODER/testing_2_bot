@@ -42,13 +42,14 @@ def get_db_connection():
         print(f"❌ DATABASE CONNECTION ERROR: {e}", file=sys.stderr)
         return None
 
-# --- DATABASE INIT ---
+# --- DATABASE INIT (AUTO-MIGRATION INCLUDED) ---
 def init_db():
     conn = get_db_connection()
     if not conn: return
     try:
         c = conn.cursor()
-        # 1. project_updates (Renamed to force fresh creation with chat_id)
+        
+        # 1. Create table if it doesn't exist
         c.execute('''
             CREATE TABLE IF NOT EXISTS project_updates (
                 id SERIAL PRIMARY KEY,
@@ -58,8 +59,15 @@ def init_db():
                 timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
-        # 2. webhooks (Secure Keys)
+
+        # 2. AUTO-MIGRATION: Add new columns if they don't exist (for existing users)
+        try:
+            c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS repo_name TEXT;")
+            c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS branch_name TEXT;")
+        except Exception as e:
+            print(f"⚠️ Migration notice: {e}")
+
+        # 3. Webhooks table
         c.execute('''
             CREATE TABLE IF NOT EXISTS webhooks (
                 secret_key TEXT PRIMARY KEY,
@@ -68,20 +76,22 @@ def init_db():
             )
         ''')
         conn.commit()
-        print("✅ PostgreSQL tables initialized!")
+        print("✅ PostgreSQL tables initialized & migrated!")
     except Exception as e:
         print(f"❌ Error during DB initialization: {e}")
     finally:
         conn.close()
 
 # --- DATABASE OPERATIONS ---
-def save_to_db(chat_id, author, summary):
+def save_to_db(chat_id, author, repo_name, branch_name, summary):
     conn = get_db_connection()
     if not conn: return
     try:
         c = conn.cursor()
-        c.execute("INSERT INTO project_updates (chat_id, author, summary, timestamp) VALUES (%s, %s, %s, NOW())", 
-                  (str(chat_id), author, summary)) 
+        c.execute("""
+            INSERT INTO project_updates (chat_id, author, repo_name, branch_name, summary, timestamp) 
+            VALUES (%s, %s, %s, %s, %s, NOW())
+        """, (str(chat_id), author, repo_name, branch_name, summary)) 
         conn.commit()
     except Exception as e:
         print(f"❌ Error saving to updates table: {e}")
@@ -162,9 +172,10 @@ def generate_ai_analysis(commit_data, files_changed):
     except Exception as e:
         return f"AI Analysis Failed: {e}"
 
-def send_to_telegram(text, author, target_bot_token, target_chat_id):
+def send_to_telegram(text, author, repo, branch, target_bot_token, target_chat_id):
     if not target_bot_token or not target_chat_id: return
     try:
+        # CLEANUP
         clean_text = text.replace("```html", "").replace("```", "")
         clean_text = clean_text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
         clean_text = clean_text.replace("<ul>", "").replace("</ul>", "")
@@ -172,12 +183,18 @@ def send_to_telegram(text, author, target_bot_token, target_chat_id):
         clean_text = clean_text.replace("<li>", "• ").replace("</li>", "\n")
         clean_text = clean_text.replace("<p>", "").replace("</p>", "\n\n")
         
+        # Time Calculation
         now_utc = datetime.utcnow()
         IST_OFFSET = timedelta(hours=5, minutes=30)
         ist_time = now_utc + IST_OFFSET
-        display_timestamp = ist_time.strftime('%Y-%m-%d %I:%M %p')
+        display_timestamp = ist_time.strftime('%I:%M %p')
         
-        header = f"👤 <b>{html.escape(author)}</b> | 🕒 {display_timestamp}"
+        # NEW HEADER with Repo and Branch
+        header = (
+            f"👤 <b>{html.escape(author)}</b>\n"
+            f"📂 <b>{html.escape(repo)}</b> (<code>{html.escape(branch)}</code>)\n"
+            f"🕒 {display_timestamp}"
+        )
         message_text = f"{header}\n\n{clean_text}"
 
         payload = {
@@ -200,6 +217,12 @@ def process_standup_task(target_bot_token, target_chat_id, author_name, data):
         all_updates = []
         commits = data.get('commits', [])
         
+        # EXTRACT REPO AND BRANCH
+        repo_name = data.get('repository', {}).get('name', 'Unknown Repo')
+        # 'ref' usually looks like 'refs/heads/main' -> split to get 'main'
+        branch_ref = data.get('ref', '')
+        branch_name = branch_ref.split('/')[-1] if branch_ref else 'unknown'
+
         if not commits and 'head_commit' in data:
             commits = [data['head_commit']]
             
@@ -209,14 +232,17 @@ def process_standup_task(target_bot_token, target_chat_id, author_name, data):
             
             summary = ai_response.strip()
             commit_id = commit.get('id', 'unknown')[:7]
+            
+            # Just store the raw summary in the list for Telegram
             all_updates.append(f"<b>Commit:</b> <code>{commit_id}</code>\n{summary}")
             
-            # Save to DB with Chat ID for Personalized Dashboard
-            save_to_db(target_chat_id, author_name, summary)
+            # Save full details to DB
+            save_to_db(target_chat_id, author_name, repo_name, branch_name, summary)
                 
         if all_updates:
             final_report = "\n\n----------------\n\n".join(all_updates)
-            send_to_telegram(final_report, author_name, target_bot_token, target_chat_id)
+            # Pass repo and branch to the sender
+            send_to_telegram(final_report, author_name, repo_name, branch_name, target_bot_token, target_chat_id)
             
         print(f"✅ BACKGROUND TASK COMPLETE for {author_name}")
     except Exception as e:
@@ -286,14 +312,13 @@ def telegram_commands():
                 "2. Paste this URL into your GitHub repository settings under Webhooks.\n"
                 "(Content Type: <code>application/json</code>, Events: <code>Just the push event</code>.)\n\n"
                 "Once added, run:\n"
-                "🔹 <code>/dashboard</code> to see your team's analytics\n"
+                "🔹 <code>/dashboard</code> to see your team's analytics\n\n"
                 "I will now start analyzing your commits!"
             )
             requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), 
                           json={"chat_id": chat_id, "text": response_text, "parse_mode": "HTML"})
             
         elif message_text.startswith('/dashboard'):
-            # Retrieve the key associated with this chat to create a secure link
             key = get_secret_from_chat_id(chat_id)
             if key:
                 dashboard_url = f"{APP_BASE_URL}/dashboard?key={key}"
@@ -309,12 +334,10 @@ def telegram_commands():
 # --- 📊 PERSONALIZED DASHBOARD ROUTE ---
 @app.route('/dashboard', methods=['GET'])
 def dashboard():
-    # Security: Require the secret key to show data
     secret_key = request.args.get('key')
     if not secret_key:
         return "<h1>401 Unauthorized</h1><p>Access denied. Please use the link provided by the bot.</p>", 401
         
-    # Get Chat ID from Key
     target_chat_id = get_chat_id_from_secret(secret_key)
     if not target_chat_id:
         return "<h1>401 Unauthorized</h1><p>Invalid dashboard key.</p>", 401
@@ -324,8 +347,13 @@ def dashboard():
     
     try:
         c = conn.cursor()
-        # Filter by CHAT_ID to show only this group's data
-        c.execute("SELECT author, summary, timestamp FROM project_updates WHERE chat_id = %s ORDER BY id DESC", (str(target_chat_id),))
+        # Updated Query to include Repo and Branch
+        c.execute("""
+            SELECT author, summary, timestamp, repo_name, branch_name 
+            FROM project_updates 
+            WHERE chat_id = %s 
+            ORDER BY id DESC
+        """, (str(target_chat_id),))
         all_updates = c.fetchall()
         
         c.execute("SELECT author, COUNT(*) FROM project_updates WHERE chat_id = %s GROUP BY author", (str(target_chat_id),))
@@ -335,7 +363,6 @@ def dashboard():
     finally:
         conn.close()
 
-    # Time sorting logic (IST)
     now_utc = datetime.utcnow()
     IST_OFFSET = timedelta(hours=5, minutes=30)
     
@@ -347,14 +374,28 @@ def dashboard():
     week_logs = []
     
     for u in all_updates:
+        # u[0]=author, u[1]=summary, u[2]=timestamp, u[3]=repo, u[4]=branch
         db_utc_time = u[2]
         ist_time = db_utc_time + IST_OFFSET
         
         db_date_str = ist_time.strftime('%Y-%m-%d')
-        display_timestamp = ist_time.strftime('%Y-%m-%d %I:%M %p')
+        display_timestamp = ist_time.strftime('%I:%M %p') # Just time, date implied by section
+        
+        # Handle potential None values for old rows
+        repo = u[3] if len(u) > 3 and u[3] else "Unknown"
+        branch = u[4] if len(u) > 4 and u[4] else "main"
+        
         summary_html = u[1].replace('\n', '<br>')
             
-        item_html = f'<div class="update-item"><div class="meta">👤 {u[0]} | 🕒 {display_timestamp}</div><pre>{summary_html}</pre></div>'
+        item_html = (
+            f'<div class="update-item">'
+            f'<div class="meta">'
+            f'👤 {u[0]} | 🕒 {display_timestamp}<br>'
+            f'📂 {repo} (<code>{branch}</code>)'
+            f'</div>'
+            f'<pre>{summary_html}</pre>'
+            f'</div>'
+        )
         
         if db_date_str == today_str:
             today_logs.append(item_html)
@@ -380,7 +421,7 @@ def dashboard():
             .card {{ background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); margin-bottom: 25px; }}
             .section-header {{ background: #e9ecef; padding: 8px 15px; border-radius: 6px; margin: 15px 0 10px; font-weight: bold; color: #555; }}
             .update-item {{ background: #fff; border-left: 4px solid #007bff; padding: 15px; margin-bottom: 10px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-            .meta {{ color: #888; font-size: 0.85em; margin-bottom: 8px; font-weight: 600; text-transform: uppercase; }}
+            .meta {{ color: #888; font-size: 0.85em; margin-bottom: 8px; font-weight: 600; }}
             pre {{ white-space: pre-wrap; font-family: 'Segoe UI', sans-serif; color: #333; margin: 0; line-height: 1.5; }}
             .empty-msg {{ color: #999; font-style: italic; padding: 10px; }}
         </style>
