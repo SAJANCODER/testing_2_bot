@@ -310,7 +310,10 @@ def telegram_commands():
         if message_text.startswith('/start'):
             guide_text = (
                 "👋 <b>Welcome to GitSync!</b>\n\n"
-                "Add me to your Telegram organization group so I can generate a unique webhook for your team.\n\n"
+                "Add me to your Telegram organization group to instantly generate a unique webhook for your team.\n\n"
+                "I’ll handle everything automatically — just drop me in, and your dashboard comes alive.\n\n"
+                "Tap →Add(User_Name:<code>@GitSynBot</code>)→ Done.\n\n"
+                "Let’s get your team synced in seconds.\n\n"
                 "Once added, run:\n"
                 "🔹 <code>/gitsync</code> to get your webhook URL\n"
                 "🔹 <code>/dashboard</code> to see your team's analytics"
@@ -325,10 +328,13 @@ def telegram_commands():
             
             response_text = (
                 "👋 <b>GitSync Setup Guide</b>\n\n"
-                "1. Copy your unique Webhook URL (The token is hidden!):\n"
+                "1. Copy your unique Webhook URL (The token is hidden!):\n\n"
                 f"<code>{webhook_url}</code>\n\n"
                 "2. Paste this URL into your GitHub repository settings under Webhooks.\n"
                 "(Content Type: <code>application/json</code>, Events: <code>Just the push event</code>.)\n\n"
+                "Once added, run:\n"
+                "🔹 <code>/gitsync</code> to get your webhook URL\n"
+                "🔹 <code>/dashboard</code> to see your team's analytics\n\n"
                 "I will now start analyzing your commits!"
             )
             requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), 
@@ -338,7 +344,7 @@ def telegram_commands():
             key = get_secret_from_chat_id(chat_id)
             if key:
                 dashboard_url = f"{APP_BASE_URL}/dashboard?key={key}"
-                response_text = f"📊 <b>Team Dashboard</b>\n\nView your team's specific analytics here:\n<a href='{dashboard_url}'>Open Dashboard</a>"
+                response_text = f"📊 <b>Team Dashboard</b>\n\nYour team’s performance graph is waiting!\nOpen the dashboard and See what your team shipped today \n<a href='{dashboard_url}'>Open Dashboard</a>"
             else:
                 response_text = "❌ <b>Error:</b> Please run <code>/gitsync</code> first to set up your group."
 
