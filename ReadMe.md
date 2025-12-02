@@ -63,7 +63,7 @@ It listens for GitHub push events, uses **Google Gemini 2.5 Pro** to analyze cod
 | `GOOGLE_API_KEY` | Your Google Gemini API Key. |
 | `TELEGRAM_BOT_TOKEN_FOR_COMMANDS` | Your Telegram Bot Token. |
 | `DATABASE_URL` | PostgreSQL Connection String (e.g., `postgres://user:pass@host/db`). |
-| `APP_BASE_URL` | Your Render App URL (e.g., `https://your-app.onrender.com`). |
+| `APP_BASE_URL` | Your Render App URL (e.g., `https://your-app-e-.onrender.com`). |
 
 ### 3. Bot Activation
 
