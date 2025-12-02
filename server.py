@@ -281,10 +281,12 @@ def telegram_commands():
             
             response_text = (
                 "👋 <b>GitSync Setup Guide</b>\n\n"
-                "1. Copy your unique Webhook URL (The token is hidden!):\n"
+                "1. Copy your unique Webhook URL (The token is hidden!):\n\n"
                 f"<code>{webhook_url}</code>\n\n"
                 "2. Paste this URL into your GitHub repository settings under Webhooks.\n"
                 "(Content Type: <code>application/json</code>, Events: <code>Just the push event</code>.)\n\n"
+                "Once added, run:\n"
+                "🔹 <code>/dashboard</code> to see your team's analytics\n"
                 "I will now start analyzing your commits!"
             )
             requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), 
