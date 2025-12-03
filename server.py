@@ -312,7 +312,7 @@ def telegram_commands():
                 "👋 <b>Welcome to GitSync!</b>\n\n"
                 "Add me to your Telegram organization group to instantly generate a unique webhook for your team.\n\n"
                 "I’ll handle everything automatically — just drop me in, and your dashboard comes alive.\n\n"
-                "Tap →Add(User_Name:<code>@GitSynBot</code>)→ Done.\n\n"
+                "Tap →Add(User_Name:<code>@QubreaSyncBot</code>)→ Done.\n\n"
                 "Let’s get your team synced in seconds.\n\n"
                 "Once added, run:\n"
                 "🔹 <code>/gitsync</code> to get your webhook URL\n"
