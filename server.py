@@ -12,7 +12,17 @@ import sys
 import html 
 import traceback
 import json 
-from maintenance import maintenance_middleware, register_admin_routes, is_maintenance_enabled 
+
+# Import maintenance functions
+# Ensure maintenance.py is in the same directory
+try:
+    from maintenance import maintenance_middleware, register_admin_routes, is_maintenance_enabled
+except ImportError:
+    print("⚠️ Maintenance module not found. Running without maintenance mode.")
+    # Dummy functions to prevent crash if file is missing
+    def maintenance_middleware(app): pass
+    def register_admin_routes(app, on_disable_flush_callback=None): pass
+    def is_maintenance_enabled(): return False
 
 # Initialize thread pool
 executor = ThreadPoolExecutor(max_workers=5) 
@@ -264,21 +274,25 @@ def get_commit_stats(repo_full_name, commit_sha):
 
 # --- AI & TELEGRAM FUNCTIONS ---
 def generate_ai_analysis(commit_msg, file_summary_text):
+    # IMPROVED PROMPT: Asking AI to infer intent and write the message
     prompt = f"""
-    You are an AI Code Reviewer. Analyze this commit data.
-    COMMIT DATA: {input_text}
+    You are a Senior Software Engineer writing a daily standup update.
+    Analyze the following code changes and write a concise, professional commit message as if you did the work.
+    
+    CONTEXT:
+    - Original Commit Message: "{commit_msg}"
+    - Files Changed & Insertions: {file_summary_text}
 
     INSTRUCTIONS:
-    1. Return valid HTML ONLY.
-    2. Telegram does NOT support <ul>, <ol>, or <li> tags. DO NOT USE THEM.
-    3. Use the text character "•" for bullet points.
-    4. Use <br> or newlines for line breaks.
-    5. Use <b> for bold, <i> for italic, <code> for code.
+    1. Ignore the original commit message if it is vague (e.g., "update", "fix"). Use the file list to determine what actually happened.
+    2. Return VALID HTML ONLY. No Markdown.
+    3. Use <b> for bolding key components or actions.
+    4. Do NOT use <ul> or <li>. Use the bullet character "•".
+    5. Keep it under 3 lines.
 
     OUTPUT FORMAT:
-    <b>Review Status:</b> [Status]
-    <b>Summary:</b> [One sentence summary]
-    <b>Technical Context:</b> [List files using • bullet points]
+    <b>Work Done:</b> [Your AI-generated description of the work]
+    <b>Impact:</b> [What this change enables or fixes]
     """
     try:
         model = genai.GenerativeModel(MODEL_NAME)
@@ -286,17 +300,16 @@ def generate_ai_analysis(commit_msg, file_summary_text):
         return response.text
     except Exception as e:
         current_app.logger.error(f"❌ Gemini Analysis Failed: {e}", exc_info=True)
-        return f"AI Analysis Failed: {e}"
+        return f"<b>AI Analysis Failed:</b> {html.escape(str(e))}"
 
 def send_to_telegram(text, author, repo, branch, target_bot_token, target_chat_id):
     if not target_bot_token or not target_chat_id: return
     try:
+        # CLEANUP: Strict HTML sanitization for Telegram
         clean_text = text.replace("```html", "").replace("```", "")
         clean_text = clean_text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-        clean_text = clean_text.replace("<ul>", "").replace("</ul>", "")
-        clean_text = clean_text.replace("<ol>", "").replace("</ol>", "")
-        clean_text = clean_text.replace("<li>", "• ").replace("</li>", "\n")
-        clean_text = clean_text.replace("<p>", "").replace("</p>", "\n\n")
+        # Remove unsupported tags
+        clean_text = re.sub(r'</?(ul|ol|li|p|div|span)[^>]*>', '', clean_text)
         
         now_utc = datetime.utcnow()
         IST_OFFSET = timedelta(hours=5, minutes=30)
@@ -313,13 +326,17 @@ def send_to_telegram(text, author, repo, branch, target_bot_token, target_chat_i
         payload = {
             "chat_id": target_chat_id,
             "text": message_text,
-            "parse_mode": "HTML" 
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
         }
         
         url = TELEGRAM_API_URL.format(token=target_bot_token)
-        requests.post(url, json=payload)
+        r = requests.post(url, json=payload)
         
-        current_app.logger.info(f"✅ Message delivered to {target_chat_id}")
+        if r.status_code != 200:
+             current_app.logger.error(f"❌ Telegram Delivery FAILED. Status: {r.status_code}. Response: {r.text}")
+        else:
+             current_app.logger.info(f"✅ Message delivered to {target_chat_id}")
     except Exception as e:
         current_app.logger.error(f"❌ Error sending to Telegram: {e}", exc_info=True)
 
@@ -355,7 +372,11 @@ def execute_commit_processing(chat_id, author_name, data):
         
         # 2. Format File List for AI Input
         file_summary_list = [f"{f['filename']} (+{f['additions']})" for f in file_details]
-        ai_input_summary = f"Commit message: {commit_msg}. Files: {len(file_details)}. Added lines: {insertions}. Touched files: {', '.join(file_summary_list)}"
+        # Limit file list to avoid token limits
+        truncated_file_list = file_summary_list[:10] 
+        ai_input_summary = f"{', '.join(truncated_file_list)}"
+        if len(file_summary_list) > 10:
+             ai_input_summary += f" ...and {len(file_summary_list)-10} more."
         
         # 3. Generate AI Summary
         ai_response = generate_ai_analysis(commit_msg, ai_input_summary)
@@ -379,10 +400,16 @@ def process_standup_task(target_bot_token, target_chat_id, author_name, data):
         current_app.logger.info(f"🛑 Maintenance ON. Queuing commit for {author_name}.")
         
         # Store the raw commit payload JSON string in the pending table
-        enqueue_pending_commit(target_chat_id, author_name, 
-                               data.get('repository', {}).get('full_name', 'Unknown'), 
-                               data.get('ref', 'unknown'), 
-                               json.dumps(data.get('commits', [])))
+        try:
+            repo_full_name = data.get('repository', {}).get('full_name', 'Unknown') 
+            branch_ref = data.get('ref', 'unknown')
+            
+            enqueue_pending_commit(target_chat_id, author_name, 
+                                   repo_full_name, 
+                                   branch_ref, 
+                                   json.dumps(data.get('commits', [])))
+        except Exception as e:
+            current_app.logger.error(f"❌ QUEUEING FAILED (Payload Error): {e}", exc_info=True)
         return
 
     # 2. Execute Processing (Maintenance OFF)
@@ -408,10 +435,8 @@ def flush_pending_callback(app, chat_id=None):
     
     for row in pending_rows:
         try:
-            # Row structure: id, chat_id, author, repo_name, branch_name, commit_data (JSON string)
             id_, chat_id, author, repo_name, branch_ref, commit_data_str = row
             
-            # Reconstruct the commits payload structure required by execute_commit_processing
             commits_list = json.loads(commit_data_str)
             
             data_payload = {
@@ -420,7 +445,6 @@ def flush_pending_callback(app, chat_id=None):
                 "ref": branch_ref
             }
             
-            # Execute processing logic (AI analysis, DB save, Telegram send)
             all_updates, display_repo_name, branch_name = execute_commit_processing(chat_id, author, data_payload)
 
             if all_updates:
@@ -435,7 +459,6 @@ def flush_pending_callback(app, chat_id=None):
             app.logger.error(f"❌ Failed to process pending commit ID {id_}: {e}")
             failed_count += 1
             
-    # Clean up successfully processed/empty commits
     delete_pending_commits_by_ids(ids_to_delete)
     
     return sent_count, failed_count, "Flush successful."
@@ -448,7 +471,6 @@ def home():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Trivial non-blocking route for Render's health check."""
     return "OK", 200
     
 @app.route('/webhook', methods=['POST'])
@@ -477,7 +499,7 @@ def telegram_commands():
     update = request.json
     
     BOT_TOKEN = TELEGRAM_BOT_TOKEN_FOR_COMMANDS
-    APP_BASE_URL_USED = APP_BASE_URL
+    APP_BASE_URL_USED = os.getenv("APP_BASE_URL")
 
     if 'message' in update:
         message = update['message']
@@ -684,12 +706,14 @@ def dashboard():
     return html
 
 # --- SAFE INIT ON STARTUP ---
-with app.app_context():
-    init_db()
-
-# 3. Apply Admin and Maintenance Middleware
+# 4. Ensure the admin routes are registered only once at the top level
 maintenance_middleware(app)
 register_admin_routes(app, on_disable_flush_callback=flush_pending_callback)
 
 if __name__ == '__main__':
-    app.run(port=5000, debug=True)
+    if len(sys.argv) > 1 and sys.argv[1] == 'init_db_sync':
+        print("Running synchronous DB initialization...")
+        with app.app_context():
+            init_db()
+    else:
+        app.run(port=5000, debug=True)
