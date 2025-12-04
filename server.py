@@ -24,7 +24,6 @@ load_dotenv()
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-# (Configuration remains the same)
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
 TELEGRAM_BOT_TOKEN_FOR_COMMANDS = os.getenv("TELEGRAM_BOT_TOKEN_FOR_COMMANDS")
 APP_BASE_URL = os.getenv("APP_BASE_URL")
@@ -33,8 +32,9 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 MODEL_NAME = 'gemini-2.5-pro' 
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
-# --- DB/OPERATIONS (All functions remain the same) ---
-# ... (get_db_connection, init_db, save_to_db, etc., remain the same)
+# --- SYSTEM SETUP ---
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
 
 # --- DATABASE CONNECTION ---
 def get_db_connection():
@@ -51,6 +51,8 @@ def init_db():
     if not conn: return
     try:
         c = conn.cursor()
+        
+        # 1. project_updates 
         c.execute('''
             CREATE TABLE IF NOT EXISTS project_updates (
                 id SERIAL PRIMARY KEY,
@@ -67,6 +69,7 @@ def init_db():
                 timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # 2. webhooks 
         c.execute('''
             CREATE TABLE IF NOT EXISTS webhooks (
                 secret_key TEXT PRIMARY KEY,
@@ -74,6 +77,7 @@ def init_db():
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # 3. pending_commits
         c.execute('''
             CREATE TABLE IF NOT EXISTS pending_commits (
                 id SERIAL PRIMARY KEY,
@@ -256,7 +260,7 @@ def get_commit_stats(repo_full_name, commit_sha):
     except Exception as e:
         current_app.logger.error(f"❌ Failed to fetch commit details: {e}")
     
-    return 0, 0, 0, 0, 0, []
+    return 0, 0, 0, 0, []
 
 # --- AI & TELEGRAM FUNCTIONS ---
 def generate_ai_analysis(commit_msg, file_summary_text):
