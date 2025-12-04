@@ -11,9 +11,7 @@ import psycopg2
 import sys
 import html 
 import traceback
-import json # Used for pending commit storage
-
-# Import maintenance functions
+import json 
 from maintenance import maintenance_middleware, register_admin_routes, is_maintenance_enabled 
 
 # Initialize thread pool
@@ -26,6 +24,7 @@ load_dotenv()
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
+# (Configuration remains the same)
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
 TELEGRAM_BOT_TOKEN_FOR_COMMANDS = os.getenv("TELEGRAM_BOT_TOKEN_FOR_COMMANDS")
 APP_BASE_URL = os.getenv("APP_BASE_URL")
@@ -34,9 +33,8 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 MODEL_NAME = 'gemini-2.5-pro' 
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
-# --- SYSTEM SETUP ---
-if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
+# --- DB/OPERATIONS (All functions remain the same) ---
+# ... (get_db_connection, init_db, save_to_db, etc., remain the same)
 
 # --- DATABASE CONNECTION ---
 def get_db_connection():
@@ -49,13 +47,10 @@ def get_db_connection():
 
 # --- DATABASE INIT ---
 def init_db():
-    # ... (function body remains the same, ensuring tables exist)
     conn = get_db_connection()
     if not conn: return
     try:
         c = conn.cursor()
-        
-        # 1. project_updates 
         c.execute('''
             CREATE TABLE IF NOT EXISTS project_updates (
                 id SERIAL PRIMARY KEY,
@@ -72,7 +67,6 @@ def init_db():
                 timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # 2. webhooks 
         c.execute('''
             CREATE TABLE IF NOT EXISTS webhooks (
                 secret_key TEXT PRIMARY KEY,
@@ -80,7 +74,6 @@ def init_db():
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # 3. pending_commits
         c.execute('''
             CREATE TABLE IF NOT EXISTS pending_commits (
                 id SERIAL PRIMARY KEY,
@@ -111,7 +104,6 @@ def init_db():
 
 # --- DATABASE OPERATIONS ---
 def save_to_db(chat_id, author, repo_name, branch_name, summary, added, modified, removed, insertions):
-    # ... (save_to_db logic remains the same)
     conn = get_db_connection()
     if not conn: return
     try:
@@ -130,7 +122,6 @@ def save_to_db(chat_id, author, repo_name, branch_name, summary, added, modified
         conn.close()
 
 def save_webhook_config(chat_id, secret_key):
-    # ... (save_webhook_config logic remains the same)
     conn = get_db_connection()
     if not conn: return
     try:
@@ -149,7 +140,6 @@ def save_webhook_config(chat_id, secret_key):
         conn.close()
 
 def get_chat_id_from_secret(secret_key):
-    # ... (get_chat_id_from_secret logic remains the same)
     conn = get_db_connection()
     if not conn: return None
     try:
@@ -164,7 +154,6 @@ def get_chat_id_from_secret(secret_key):
         conn.close()
 
 def get_secret_from_chat_id(chat_id):
-    # ... (get_secret_from_chat_id logic remains the same)
     conn = get_db_connection()
     if not conn: return None
     try:
@@ -243,7 +232,7 @@ def delete_pending_commits_by_ids(ids):
 # --- GITHUB API HELPER ---
 def get_commit_stats(repo_full_name, commit_sha):
     if not GITHUB_TOKEN:
-        return 0, 0, 0, 0, 0, []
+        return 0, 0, 0, 0, []
         
     url = f"https://api.github.com/repos/{repo_full_name}/commits/{commit_sha}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
@@ -257,7 +246,6 @@ def get_commit_stats(repo_full_name, commit_sha):
             
             insertions = stats.get('additions', 0)
             
-            # Count file changes by status
             added_count = len([f for f in files if f.get('status') == 'added'])
             removed_count = len([f for f in files if f.get('status') == 'removed'])
             modified_count = len([f for f in files if f.get('status') == 'modified'])
@@ -333,7 +321,7 @@ def execute_commit_processing(chat_id, author_name, data):
     all_updates = []
     commits = data.get('commits', [])
     
-    # Extract Repo info from payload (must be careful with nested dicts)
+    # Extract Repo info from payload
     repo_data = data.get('repository', {})
     repo_full_name = repo_data.get('full_name', 'Unknown/Repo') 
     repo_name = repo_data.get('name', 'Unknown Repo')
@@ -344,7 +332,6 @@ def execute_commit_processing(chat_id, author_name, data):
     branch_ref = data.get('ref', '')
     branch_name = branch_ref.split('/')[-1] if branch_ref else 'unknown'
 
-    # Fallback to single commit head if 'commits' is missing (for specific events)
     if not commits and 'head_commit' in data:
         commits = [data['head_commit']]
         
@@ -449,6 +436,11 @@ def flush_pending_callback(app, chat_id=None):
 def home():
     return "GitSync Bot Active"
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Trivial non-blocking route for Render's health check."""
+    return "OK", 200
+    
 @app.route('/webhook', methods=['POST'])
 def git_webhook():
     data = request.json
@@ -582,7 +574,6 @@ def dashboard():
         db_date_str = ist_time.strftime('%Y-%m-%d')
         display_timestamp = ist_time.strftime('%I:%M %p')
         
-        # Safe access to fields (u[5] is insertions here, u[3/4] are repo/branch)
         repo = u[3] if u[3] else "Unknown"
         branch = u[4] if u[4] else "main"
         insertions = u[5] if u[5] is not None else 0
