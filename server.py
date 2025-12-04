@@ -1,3 +1,4 @@
+from maintenance import maintenance_middleware, register_admin_routes
 import google.generativeai as genai
 from flask import Flask, request, jsonify, redirect
 from dotenv import load_dotenv
@@ -20,6 +21,8 @@ load_dotenv()
 
 # 2. Initialize Flask App
 app = Flask(__name__)
+maintenance_middleware(app)
+register_admin_routes(app)
 
 # --- CONFIGURATION ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
