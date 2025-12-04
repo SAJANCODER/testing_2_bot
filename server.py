@@ -11,9 +11,9 @@ import psycopg2
 import sys
 import html 
 import traceback
-import json # Added for pending commit storage
+import json # Used for pending commit storage
 
-# Import maintenance functions (assuming maintenance.py is available)
+# Import maintenance functions
 from maintenance import maintenance_middleware, register_admin_routes, is_maintenance_enabled 
 
 # Initialize thread pool
@@ -30,7 +30,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 TELEGRAM_BOT_TOKEN_FOR_COMMANDS = os.getenv("TELEGRAM_BOT_TOKEN_FOR_COMMANDS")
 APP_BASE_URL = os.getenv("APP_BASE_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") # REQUIRED for API stats
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") 
 MODEL_NAME = 'gemini-2.5-pro' 
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
@@ -47,14 +47,15 @@ def get_db_connection():
         current_app.logger.error(f"❌ DATABASE CONNECTION ERROR: {e}", exc_info=True)
         return None
 
-# --- DATABASE INIT (AUTO-MIGRATION) ---
+# --- DATABASE INIT ---
 def init_db():
+    # ... (function body remains the same, ensuring tables exist)
     conn = get_db_connection()
     if not conn: return
     try:
         c = conn.cursor()
         
-        # 1. Create base tables if they don't exist
+        # 1. project_updates 
         c.execute('''
             CREATE TABLE IF NOT EXISTS project_updates (
                 id SERIAL PRIMARY KEY,
@@ -71,6 +72,7 @@ def init_db():
                 timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # 2. webhooks 
         c.execute('''
             CREATE TABLE IF NOT EXISTS webhooks (
                 secret_key TEXT PRIMARY KEY,
@@ -78,6 +80,7 @@ def init_db():
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # 3. pending_commits
         c.execute('''
             CREATE TABLE IF NOT EXISTS pending_commits (
                 id SERIAL PRIMARY KEY,
@@ -90,7 +93,7 @@ def init_db():
             )
         ''')
         
-        # 2. AUTO-MIGRATION: Add new columns if they don't exist
+        # 4. AUTO-MIGRATION (Adding columns for stats)
         try:
             c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS insertions INTEGER DEFAULT 0;")
             c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS files_added INTEGER DEFAULT 0;")
@@ -108,6 +111,7 @@ def init_db():
 
 # --- DATABASE OPERATIONS ---
 def save_to_db(chat_id, author, repo_name, branch_name, summary, added, modified, removed, insertions):
+    # ... (save_to_db logic remains the same)
     conn = get_db_connection()
     if not conn: return
     try:
@@ -126,6 +130,7 @@ def save_to_db(chat_id, author, repo_name, branch_name, summary, added, modified
         conn.close()
 
 def save_webhook_config(chat_id, secret_key):
+    # ... (save_webhook_config logic remains the same)
     conn = get_db_connection()
     if not conn: return
     try:
@@ -144,6 +149,7 @@ def save_webhook_config(chat_id, secret_key):
         conn.close()
 
 def get_chat_id_from_secret(secret_key):
+    # ... (get_chat_id_from_secret logic remains the same)
     conn = get_db_connection()
     if not conn: return None
     try:
@@ -158,6 +164,7 @@ def get_chat_id_from_secret(secret_key):
         conn.close()
 
 def get_secret_from_chat_id(chat_id):
+    # ... (get_secret_from_chat_id logic remains the same)
     conn = get_db_connection()
     if not conn: return None
     try:
@@ -232,14 +239,11 @@ def delete_pending_commits_by_ids(ids):
         current_app.logger.error("❌ Pending delete error:", e)
     finally:
         conn.close()
-# ----------------- end pending helpers -----------------
-
 
 # --- GITHUB API HELPER ---
 def get_commit_stats(repo_full_name, commit_sha):
-    """Fetches detailed stats (insertions) for a commit using GitHub API."""
     if not GITHUB_TOKEN:
-        return 0, 0, 0, 0, [] # insertions, added, modified, removed, files
+        return 0, 0, 0, 0, 0, []
         
     url = f"https://api.github.com/repos/{repo_full_name}/commits/{commit_sha}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
@@ -252,9 +256,8 @@ def get_commit_stats(repo_full_name, commit_sha):
             files = data.get('files', [])
             
             insertions = stats.get('additions', 0)
-            deletions = stats.get('deletions', 0)
             
-            # Count file changes
+            # Count file changes by status
             added_count = len([f for f in files if f.get('status') == 'added'])
             removed_count = len([f for f in files if f.get('status') == 'removed'])
             modified_count = len([f for f in files if f.get('status') == 'modified'])
@@ -265,7 +268,7 @@ def get_commit_stats(repo_full_name, commit_sha):
     except Exception as e:
         current_app.logger.error(f"❌ Failed to fetch commit details: {e}")
     
-    return 0, 0, 0, 0, []
+    return 0, 0, 0, 0, 0, []
 
 # --- AI & TELEGRAM FUNCTIONS ---
 def generate_ai_analysis(commit_msg, file_summary_text):
@@ -377,6 +380,7 @@ def process_standup_task(target_bot_token, target_chat_id, author_name, data):
     # 1. Check Maintenance Mode
     if is_maintenance_enabled():
         current_app.logger.info(f"🛑 Maintenance ON. Queuing commit for {author_name}.")
+        
         # Store the raw commit payload JSON string in the pending table
         enqueue_pending_commit(target_chat_id, author_name, 
                                data.get('repository', {}).get('full_name', 'Unknown'), 
@@ -413,7 +417,6 @@ def flush_pending_callback(app, chat_id=None):
             # Reconstruct the commits payload structure required by execute_commit_processing
             commits_list = json.loads(commit_data_str)
             
-            # We need to construct a partial 'data' dict expected by execute_commit_processing
             data_payload = {
                 "commits": commits_list, 
                 "repository": {"full_name": repo_name, "name": repo_name.split('/')[-1]}, 
@@ -429,7 +432,6 @@ def flush_pending_callback(app, chat_id=None):
                 ids_to_delete.append(id_)
                 sent_count += 1
             else:
-                # If AI returned nothing, still delete from queue to avoid blockage
                 ids_to_delete.append(id_) 
                 
         except Exception as e:
@@ -440,13 +442,6 @@ def flush_pending_callback(app, chat_id=None):
     delete_pending_commits_by_ids(ids_to_delete)
     
     return sent_count, failed_count, "Flush successful."
-# -------------------------------------------------------------------------
-
-
-# 3. Apply Admin and Maintenance Middleware
-maintenance_middleware(app)
-register_admin_routes(app, on_disable_flush_callback=flush_pending_callback)
-
 
 # --- ROUTES ---
 
