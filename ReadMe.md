@@ -101,4 +101,4 @@ It listens for GitHub push events, uses **Google Gemini 2.5 Pro** to analyze cod
 
 ## 🛡️ Security Note
 
-> This project uses a Secret Key validation mechanism. Every time `/gitsync` is run, a new UUID is generated and linked specifically to that Telegram Group ID in the database. Webhooks without a matching key/ID will be rejecteded.
+> This project uses a Secret Key validation mechanism. Every time `/gitsync` is run, a new UUID is generated and linked specifically to that Telegram Group ID in the database. Webhooks without a matching key/ID will be rejected.
