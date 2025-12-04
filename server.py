@@ -265,11 +265,17 @@ def get_commit_stats(repo_full_name, commit_sha):
 # --- AI & TELEGRAM FUNCTIONS ---
 def generate_ai_analysis(commit_msg, file_summary_text):
     prompt = f"""
-    You are an AI Code Reviewer. Analyze this commit message and files changed.
-    COMMIT MESSAGE: {commit_msg}
-    FILES CHANGED: {file_summary_text}
+    You are an AI Code Reviewer. Analyze this commit data.
+    COMMIT DATA: {input_text}
 
-    OUTPUT FORMAT (HTML ONLY, No Markdown, Use <b> for bold):
+    INSTRUCTIONS:
+    1. Return valid HTML ONLY.
+    2. Telegram does NOT support <ul>, <ol>, or <li> tags. DO NOT USE THEM.
+    3. Use the text character "•" for bullet points.
+    4. Use <br> or newlines for line breaks.
+    5. Use <b> for bold, <i> for italic, <code> for code.
+
+    OUTPUT FORMAT:
     <b>Review Status:</b> [Status]
     <b>Summary:</b> [One sentence summary]
     <b>Technical Context:</b> [List files using • bullet points]
