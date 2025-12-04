@@ -333,7 +333,6 @@ def telegram_commands():
                 "2. Paste this URL into your GitHub repository settings under Webhooks.\n"
                 "(Content Type: <code>application/json</code>, Events: <code>Just the push event</code>.)\n\n"
                 "Once added, run:\n"
-                "🔹 <code>/gitsync</code> to get your webhook URL\n"
                 "🔹 <code>/dashboard</code> to see your team's analytics\n\n"
                 "I will now start analyzing your commits!"
             )
