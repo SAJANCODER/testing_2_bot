@@ -510,7 +510,8 @@
     </div>
 
     <script>
-        const dailyData = JSON.parse(`{{ daily_chart_data | tojson | safe }}`);
+        const dailyData = {{ daily_chart_data | tojson | safe }};
+
 
 
         const ctx = document.getElementById('dailyChart').getContext('2d');
