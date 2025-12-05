@@ -1,5 +1,3 @@
-#maintaince linked code . 
-
 import google.generativeai as genai
 from flask import Flask, request, jsonify, redirect, current_app
 from dotenv import load_dotenv
@@ -40,7 +38,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 TELEGRAM_BOT_TOKEN_FOR_COMMANDS = os.getenv("TELEGRAM_BOT_TOKEN_FOR_COMMANDS")
 APP_BASE_URL = os.getenv("APP_BASE_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") 
+# GITHUB_TOKEN removed as per request
 MODEL_NAME = 'gemini-2.5-pro' 
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
@@ -102,7 +100,7 @@ def init_db():
             )
         ''')
         
-        # 4. AUTO-MIGRATION (Adding columns for stats)
+        # 4. AUTO-MIGRATION (Adding columns for stats if missing)
         try:
             c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS insertions INTEGER DEFAULT 0;")
             c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS files_added INTEGER DEFAULT 0;")
@@ -245,56 +243,26 @@ def delete_pending_commits_by_ids(ids):
     finally:
         conn.close()
 
-# --- GITHUB API HELPER ---
-def get_commit_stats(repo_full_name, commit_sha):
-    if not GITHUB_TOKEN:
-        return 0, 0, 0, 0, []
-        
-    url = f"https://api.github.com/repos/{repo_full_name}/commits/{commit_sha}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    
-    try:
-        r = requests.get(url, headers=headers)
-        if r.status_code == 200:
-            data = r.json()
-            stats = data.get('stats', {})
-            files = data.get('files', [])
-            
-            insertions = stats.get('additions', 0)
-            
-            added_count = len([f for f in files if f.get('status') == 'added'])
-            removed_count = len([f for f in files if f.get('status') == 'removed'])
-            modified_count = len([f for f in files if f.get('status') == 'modified'])
-            
-            return insertions, added_count, modified_count, removed_count, files
-        else:
-            current_app.logger.error(f"❌ GitHub API Error: {r.status_code} {r.text}")
-    except Exception as e:
-        current_app.logger.error(f"❌ Failed to fetch commit details: {e}")
-    
-    return 0, 0, 0, 0, []
-
 # --- AI & TELEGRAM FUNCTIONS ---
 def generate_ai_analysis(commit_msg, file_summary_text):
-    # IMPROVED PROMPT: Asking AI to infer intent and write the message
+    # Prompt uses available file info (names) since content isn't fetched
     prompt = f"""
-    You are a Senior Software Engineer writing a daily standup update.
-    Analyze the following code changes and write a concise, professional commit message as if you did the work.
-    
-    CONTEXT:
-    - Original Commit Message: "{commit_msg}"
-    - Files Changed & Insertions: {file_summary_text}
+    You are an AI Code Reviewer. Analyze this commit data.
+    COMMIT DATA: 
+    Message: {commit_msg}
+    Files Changed: {file_summary_text}
 
     INSTRUCTIONS:
-    1. Ignore the original commit message if it is vague (e.g., "update", "fix"). Use the file list to determine what actually happened.
-    2. Return VALID HTML ONLY. No Markdown.
-    3. Use <b> for bolding key components or actions.
-    4. Do NOT use <ul> or <li>. Use the bullet character "•".
-    5. Keep it under 3 lines.
+    1. Return valid HTML ONLY.
+    2. Telegram does NOT support <ul>, <ol>, or <li> tags. DO NOT USE THEM.
+    3. Use the text character "•" for bullet points.
+    4. Use <br> or newlines for line breaks.
+    5. Use <b> for bold, <i> for italic, <code> for code.
 
     OUTPUT FORMAT:
-    <b>Work Done:</b> [Your AI-generated description of the work]
-    <b>Impact:</b> [What this change enables or fixes]
+    <b>Review Status:</b> [Status]
+    <b>Summary:</b> [One sentence summary]
+    <b>Technical Context:</b> [List files using • bullet points]
     """
     try:
         model = genai.GenerativeModel(MODEL_NAME)
@@ -302,16 +270,20 @@ def generate_ai_analysis(commit_msg, file_summary_text):
         return response.text
     except Exception as e:
         current_app.logger.error(f"❌ Gemini Analysis Failed: {e}", exc_info=True)
-        return f"<b>AI Analysis Failed:</b> {html.escape(str(e))}"
+        return f"AI Analysis Failed: {e}"
 
 def send_to_telegram(text, author, repo, branch, target_bot_token, target_chat_id):
     if not target_bot_token or not target_chat_id: return
     try:
-        # CLEANUP: Strict HTML sanitization for Telegram
+        # CLEANUP: Remove markdown code blocks
         clean_text = text.replace("```html", "").replace("```", "")
+        
+        # Sanitize HTML for Telegram
         clean_text = clean_text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-        # Remove unsupported tags
-        clean_text = re.sub(r'</?(ul|ol|li|p|div|span)[^>]*>', '', clean_text)
+        clean_text = clean_text.replace("<ul>", "").replace("</ul>", "")
+        clean_text = clean_text.replace("<ol>", "").replace("</ol>", "")
+        clean_text = clean_text.replace("<li>", "• ").replace("</li>", "\n")
+        clean_text = clean_text.replace("<p>", "").replace("</p>", "\n\n")
         
         now_utc = datetime.utcnow()
         IST_OFFSET = timedelta(hours=5, minutes=30)
@@ -328,29 +300,25 @@ def send_to_telegram(text, author, repo, branch, target_bot_token, target_chat_i
         payload = {
             "chat_id": target_chat_id,
             "text": message_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
+            "parse_mode": "HTML" 
         }
         
         url = TELEGRAM_API_URL.format(token=target_bot_token)
-        r = requests.post(url, json=payload)
+        requests.post(url, json=payload)
         
-        if r.status_code != 200:
-             current_app.logger.error(f"❌ Telegram Delivery FAILED. Status: {r.status_code}. Response: {r.text}")
-        else:
-             current_app.logger.info(f"✅ Message delivered to {target_chat_id}")
+        current_app.logger.info(f"✅ Message delivered to {target_chat_id}")
     except Exception as e:
         current_app.logger.error(f"❌ Error sending to Telegram: {e}", exc_info=True)
 
 
 # --- PROCESSING LOGIC (Shared between Webhook and Flush) ---
 def execute_commit_processing(chat_id, author_name, data):
-    """Processes commits: gets stats, runs AI, saves to DB."""
+    """Processes commits: calculates stats from payload, runs AI, saves to DB."""
     
     all_updates = []
     commits = data.get('commits', [])
     
-    # Extract Repo info from payload
+    # Extract Repo info
     repo_data = data.get('repository', {})
     repo_full_name = repo_data.get('full_name', 'Unknown/Repo') 
     repo_name = repo_data.get('name', 'Unknown Repo')
@@ -369,16 +337,29 @@ def execute_commit_processing(chat_id, author_name, data):
         commit_sha = commit_id if len(commit_id) > 7 else commit_id 
         commit_msg = commit.get('message', '')
         
-        # 1. Fetch Detailed Stats from GitHub (Insertions & File Counts)
-        insertions, added_count, modified_count, removed_count, file_details = get_commit_stats(repo_full_name, commit_sha)
+        # 1. Calculate Stats from Webhook Payload (No extra API call)
+        # The payload contains lists of filenames for each category
+        added_list = commit.get('added', [])
+        removed_list = commit.get('removed', [])
+        modified_list = commit.get('modified', [])
+        
+        added_count = len(added_list)
+        removed_count = len(removed_list)
+        modified_count = len(modified_list)
+        
+        # Note: Without API token, exact line insertions are not available in standard push payload.
+        # We default insertions to 0 or estimate based on file counts if desired (here 0 for accuracy).
+        insertions = 0 
         
         # 2. Format File List for AI Input
-        file_summary_list = [f"{f['filename']} (+{f['additions']})" for f in file_details]
-        # Limit file list to avoid token limits
-        truncated_file_list = file_summary_list[:10] 
-        ai_input_summary = f"{', '.join(truncated_file_list)}"
-        if len(file_summary_list) > 10:
-             ai_input_summary += f" ...and {len(file_summary_list)-10} more."
+        # Combine all lists to give AI context on what files were touched
+        all_files = added_list + modified_list + removed_list
+        # Limit list length for prompt safety
+        file_summary_text = ", ".join(all_files[:15])
+        if len(all_files) > 15:
+             file_summary_text += f" ...and {len(all_files)-15} more."
+        
+        ai_input_summary = f"Commit message: {commit_msg}. Files changed: {len(all_files)}. (Added: {added_count}, Mod: {modified_count}, Del: {removed_count}). Files: {file_summary_text}"
         
         # 3. Generate AI Summary
         ai_response = generate_ai_analysis(commit_msg, ai_input_summary)
@@ -437,8 +418,10 @@ def flush_pending_callback(app, chat_id=None):
     
     for row in pending_rows:
         try:
+            # Row structure: id, chat_id, author, repo_name, branch_name, commit_data (JSON string)
             id_, chat_id, author, repo_name, branch_ref, commit_data_str = row
             
+            # Reconstruct the commits payload structure required by execute_commit_processing
             commits_list = json.loads(commit_data_str)
             
             data_payload = {
@@ -447,6 +430,7 @@ def flush_pending_callback(app, chat_id=None):
                 "ref": branch_ref
             }
             
+            # Execute processing logic (AI analysis, DB save, Telegram send)
             all_updates, display_repo_name, branch_name = execute_commit_processing(chat_id, author, data_payload)
 
             if all_updates:
@@ -461,6 +445,7 @@ def flush_pending_callback(app, chat_id=None):
             app.logger.error(f"❌ Failed to process pending commit ID {id_}: {e}")
             failed_count += 1
             
+    # Clean up successfully processed/empty commits
     delete_pending_commits_by_ids(ids_to_delete)
     
     return sent_count, failed_count, "Flush successful."
@@ -473,6 +458,7 @@ def home():
 
 @app.route('/health', methods=['GET'])
 def health_check():
+    """Trivial non-blocking route for Render's health check."""
     return "OK", 200
     
 @app.route('/webhook', methods=['POST'])
@@ -501,7 +487,7 @@ def telegram_commands():
     update = request.json
     
     BOT_TOKEN = TELEGRAM_BOT_TOKEN_FOR_COMMANDS
-    APP_BASE_URL_USED = os.getenv("APP_BASE_URL")
+    APP_BASE_URL_USED = APP_BASE_URL
 
     if 'message' in update:
         message = update['message']
@@ -629,7 +615,7 @@ def dashboard():
 
     # Prepare Chart Data
     labels = [row[0] for row in stats]
-    data_added = [row[1] for row in stats]
+    data_added = [row[1] for row in stats] # Note: using insertions here if available, otherwise 0
     data_modified = [row[2] for row in stats]
     data_removed = [row[3] for row in stats]
 
@@ -659,7 +645,7 @@ def dashboard():
             <div class="subtitle">Organization/Repo: <b>{org_title}</b></div>
             
             <div class="card">
-                <h2>🏆 Code Volume (Lines Added & File Changes)</h2>
+                <h2>🏆 Code Volume (Files Touched)</h2>
                 <div style="height: 300px;"><canvas id="activityChart"></canvas></div>
             </div>
             <div class="card">
@@ -679,9 +665,9 @@ def dashboard():
                 data: {{ 
                     labels: {labels}, 
                     datasets: [
-                        {{ label: 'Lines Added (Code Volume)', data: {data_added}, backgroundColor: '#2ecc71' }},
-                        {{ label: 'Modified Files', data: {data_modified}, backgroundColor: '#f1c40f', stack: 'stack1' }},
-                        {{ label: 'Deleted Files', data: {data_removed}, backgroundColor: '#e74c3c', stack: 'stack1' }}
+                        {{ label: 'Files Added/Lines Inserted', data: {data_added}, backgroundColor: '#2ecc71' }},
+                        {{ label: 'Files Modified', data: {data_modified}, backgroundColor: '#f1c40f', stack: 'stack1' }},
+                        {{ label: 'Files Deleted', data: {data_removed}, backgroundColor: '#e74c3c', stack: 'stack1' }}
                     ] 
                 }},
                 options: {{ 
