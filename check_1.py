@@ -378,34 +378,41 @@ def execute_commit_processing(chat_id, author_name, data):
 def process_standup_task(target_bot_token, target_chat_id, author_name, data):
     """Handles core processing or queues the task if maintenance is active."""
     
-    # 1. Check Maintenance Mode
-    if is_maintenance_enabled():
-        current_app.logger.info(f"🛑 Maintenance ON. Queuing commit for {author_name}.")
-        
-        # Store the raw commit payload JSON string in the pending table
+    # CRITICAL FIX: Push the app context so current_app works in this thread
+    with app.app_context():
         try:
-            repo_full_name = data.get('repository', {}).get('full_name', 'Unknown') 
-            branch_ref = data.get('ref', 'unknown')
-            
-            enqueue_pending_commit(target_chat_id, author_name, 
-                                   repo_full_name, 
-                                   branch_ref, 
-                                   json.dumps(data.get('commits', [])))
-        except Exception as e:
-            current_app.logger.error(f"❌ QUEUEING FAILED (Payload Error): {e}", exc_info=True)
-        return
+            # 1. Check Maintenance Mode
+            if is_maintenance_enabled():
+                current_app.logger.info(f"🛑 Maintenance ON. Queuing commit for {author_name}.")
+                
+                # Store the raw commit payload JSON string in the pending table
+                try:
+                    repo_full_name = data.get('repository', {}).get('full_name', 'Unknown') 
+                    branch_ref = data.get('ref', 'unknown')
+                    
+                    # Save the entire 'commits' list as JSON
+                    commits_data = json.dumps(data.get('commits', []))
+                    
+                    enqueue_pending_commit(target_chat_id, author_name, 
+                                           repo_full_name, 
+                                           branch_ref, 
+                                           commits_data)
+                except Exception as e:
+                    current_app.logger.error(f"❌ QUEUEING FAILED (Payload Error): {e}", exc_info=True)
+                return
 
-    # 2. Execute Processing (Maintenance OFF)
-    try:
-        all_updates, display_repo_name, branch_name = execute_commit_processing(target_chat_id, author_name, data)
-        
-        if all_updates:
-            final_report = "\n\n----------------\n\n".join(all_updates)
-            send_to_telegram(final_report, author_name, display_repo_name, branch_name, target_bot_token, target_chat_id)
+            # 2. Execute Processing (Maintenance OFF)
+            all_updates, display_repo_name, branch_name = execute_commit_processing(target_chat_id, author_name, data)
             
-        current_app.logger.info(f"✅ BACKGROUND TASK COMPLETE for {author_name}")
-    except Exception as e:
-        current_app.logger.error(f"❌ CRITICAL ERROR in worker: {e}", exc_info=True)
+            if all_updates:
+                final_report = "\n\n----------------\n\n".join(all_updates)
+                send_to_telegram(final_report, author_name, display_repo_name, branch_name, target_bot_token, target_chat_id)
+                
+            current_app.logger.info(f"✅ BACKGROUND TASK COMPLETE for {author_name}")
+            
+        except Exception as e:
+            # This catch ensures the thread doesn't die silently
+            current_app.logger.error(f"❌ CRITICAL ERROR in background worker: {e}", exc_info=True)
 
 # --- FLUSH CALLBACK (Called by admin routes) ---
 def flush_pending_callback(app, chat_id=None):
@@ -478,10 +485,12 @@ def git_webhook():
     elif 'sender' in data:
         author_name = data['sender']['login']
 
+    # The executor submits the function. 
+    # The 'with app.app_context():' inside the function handles the context.
     executor.submit(process_standup_task, TELEGRAM_BOT_TOKEN_FOR_COMMANDS, target_chat_id, author_name, data)
         
     return jsonify({"status": "processing", "message": "Accepted"}), 200
-
+    
 @app.route('/telegram_commands', methods=['POST'])
 def telegram_commands():
     update = request.json
