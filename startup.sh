@@ -14,4 +14,4 @@ $PYTHON_EXEC server.py init_db_sync
 # --timeout 120: Increases the worker boot timeout from 60s to 120s (crucial for slow DB connections).
 # --workers 2: Standard worker count for better concurrency.
 echo "Starting Gunicorn server..."
-exec gunicorn check_1:app --timeout 120 --workers 2 --bind 0.0.0.0:$PORT
+exec gunicorn server:app --timeout 120 --workers 2 --bind 0.0.0.0:$PORT
