@@ -4,7 +4,7 @@
 PYTHON_EXEC="/usr/local/bin/python"
 
 # --- 1. Database Initialization (Blocking but necessary) ---
-# We call the server file with a specific argument.
+
 # This runs the init_db() logic safely without starting Flask's app.run().
 echo "Running database initialization and migration..."
 $PYTHON_EXEC server.py init_db_sync
