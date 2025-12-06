@@ -18,6 +18,7 @@ from collections import defaultdict
 import random
 from cryptography.fernet import Fernet
 from psycopg2.extras import RealDictCursor
+from flask import render_template
 
 # Initialize thread pool
 executor = ThreadPoolExecutor(max_workers=5)
@@ -1190,20 +1191,8 @@ def dashboard():
         conn.close()
 
         # Render the dashboard template from file if present
-        try:
-            with open('templates/dashboard.html', 'r', encoding='utf-8') as f:
-                template = f.read()
-            return render_template_string(template, **template_data)
-        except FileNotFoundError:
-            # minimal fallback
-            return f"""
-            <html><body style="font-family: Arial;">
-            <h1>Dashboard - {html.escape(org_title)}</h1>
-            <p>Today lines added: {template_data['today_stats']['lines_added']}</p>
-            <p>Today lines removed: {template_data['today_stats']['lines_removed']}</p>
-            <p>Leaderboard: {', '.join([x['name']+':'+str(x['score']) for x in leaderboard[:5]])}</p>
-            </body></html>
-            """, 200
+        # Cleaner approach
+        return render_template('dashboard.html', **template_data)
 
     except Exception as e:
         print("dashboard error:", e)
