@@ -532,7 +532,7 @@
                     <div class="value">{{ today_stats.total_commits }}</div>
                     <div class="change {{ 'positive' if today_stats.change_percentage >= 0 else 'negative' }}">
                         <i class="fas fa-arrow-{{ 'up' if today_stats.change_percentage >= 0 else 'down' }}"></i>
-                        {{ today_stats.change_percentage|abs }}% from yesterday
+                        {{ today_stats.change_percentage|abs }}% change
                     </div>
                 </div>
             </div>
@@ -544,9 +544,9 @@
                 <div class="stat-content">
                     <h3>Files Changed</h3>
                     <div class="value">{{ today_stats.files_changed }}</div>
-                    <div class="change {{ 'positive' if today_stats.files_change_percentage >= 0 else 'negative' }}">
-                        <i class="fas fa-arrow-{{ 'up' if today_stats.files_change_percentage >= 0 else 'down' }}"></i>
-                        {{ today_stats.files_change_percentage|abs }}% change
+                    <div class="change {{ 'positive' if today_stats.change_percentage >= 0 else 'negative' }}">
+                        <i class="fas fa-arrow-{{ 'up' if today_stats.change_percentage >= 0 else 'down' }}"></i>
+                        {{ today_stats.change_percentage|abs }}% change
                     </div>
                 </div>
             </div>
