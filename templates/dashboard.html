@@ -2,317 +2,595 @@
 <html lang="en">
 
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Team Performance Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>{{ org_title }} — Team Dashboard</title>
+
+    <!-- Chart.js + plugins -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.0.0"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+
     <style>
         :root {
-            --primary: #4361ee;
-            --secondary: #3a0ca3;
-            --success: #4cc9f0;
-            --warning: #f72585;
-            --dark: #1a1a2e;
-            --light: #f8f9fa;
-            --gray: #6c757d;
-            --light-gray: #e9ecef;
-            --card-bg: #ffffff;
-            --shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
-            --border-radius: 16px;
-            --transition: all 0.3s ease;
+            --bg: #f6f8fb;
+            --card: #fff;
+            --muted: #6b7280;
+            --accent: #4361ee;
+            --accent-2: #3a0ca3;
+            --success: #16a34a;
+            --danger: #ef4444;
+            --radius: 12px;
+            --shadow: 0 8px 30px rgba(15, 23, 42, 0.06);
         }
 
         * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+            box-sizing: border-box
         }
 
         body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-            color: var(--dark);
-            line-height: 1.6;
-            min-height: 100vh;
-            padding: 20px;
+            margin: 0;
+            font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial;
+            background: linear-gradient(180deg, #eef2ff 0%, #f8fafc 100%);
+            color: #0f172a;
+            padding: 22px;
         }
 
-        .dashboard-container {
-            max-width: 1400px;
-            margin: 0 auto;
+        .wrap {
+            max-width: 1200px;
+            margin: 0 auto
         }
 
-        .dashboard-header {
-            background: linear-gradient(135deg, var(--primary), var(--secondary));
-            color: white;
-            padding: 25px 30px;
-            border-radius: var(--border-radius);
-            margin-bottom: 25px;
-            box-shadow: var(--shadow);
-        }
-
-        .header-left h1 {
-            font-size: 2.2rem;
-            font-weight: 700;
-            margin-bottom: 5px;
+        header.top {
             display: flex;
             align-items: center;
+            justify-content: space-between;
             gap: 12px;
+            margin-bottom: 18px
         }
 
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-bottom: 25px;
-        }
-
-        .stat-card {
-            background: var(--card-bg);
-            padding: 25px;
-            border-radius: var(--border-radius);
-            box-shadow: var(--shadow);
+        .brand {
             display: flex;
             align-items: center;
-            gap: 20px;
-            transition: var(--transition);
-            border-left: 5px solid var(--primary);
+            gap: 12px
         }
 
-        .stat-icon {
-            width: 60px;
-            height: 60px;
+        .brand .logo {
+            width: 52px;
+            height: 52px;
             border-radius: 12px;
+            background: linear-gradient(135deg, var(--accent), var(--accent-2));
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 1.8rem;
+            color: white
+        }
+
+        .meta {
+            color: var(--muted);
+            font-size: 13px
+        }
+
+        .controls {
+            display: flex;
+            gap: 8px;
+            align-items: center
+        }
+
+        .button {
+            padding: 8px 12px;
+            border-radius: 10px;
+            border: none;
+            background: var(--accent);
             color: white;
+            cursor: pointer;
+            font-weight: 600
         }
 
-        .stat-content h3 {
-            font-size: 1rem;
-            color: var(--gray);
-            margin-bottom: 8px;
-            font-weight: 600;
+        .button.ghost {
+            background: transparent;
+            color: var(--accent);
+            border: 1px solid rgba(67, 97, 238, 0.12)
         }
 
-        .stat-content .value {
-            font-size: 2rem;
-            font-weight: 700;
-            color: var(--dark);
-            line-height: 1;
+        .top-actions {
+            display: flex;
+            gap: 8px;
+            align-items: center
         }
 
-        .content-grid {
+        .grid {
             display: grid;
-            grid-template-columns: 2fr 1fr;
-            gap: 25px;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 12px;
+            margin-bottom: 16px
         }
 
-        .chart-container {
-            background: var(--card-bg);
-            padding: 30px;
-            border-radius: var(--border-radius);
+        .card {
+            background: var(--card);
+            border-radius: var(--radius);
             box-shadow: var(--shadow);
-            margin-bottom: 25px;
+            padding: 16px
         }
 
-        .leaderboard-container {
-            background: var(--card-bg);
-            padding: 30px;
-            border-radius: var(--border-radius);
-            box-shadow: var(--shadow);
+        .stat {
+            display: flex;
+            gap: 12px;
+            align-items: center
         }
 
-        .leaderboard-item {
+        .stat .icon {
+            width: 52px;
+            height: 52px;
+            border-radius: 10px;
             display: flex;
             align-items: center;
-            gap: 15px;
-            padding: 15px;
-            background: var(--light);
-            border-radius: 12px;
-            margin-bottom: 10px;
+            justify-content: center;
+            color: white
         }
 
-        .positive {
-            color: #2ecc71;
+        .stat h3 {
+            margin: 0;
+            font-size: 13px;
+            color: var(--muted)
         }
 
-        .negative {
-            color: #e74c3c;
+        .stat .val {
+            font-weight: 800;
+            font-size: 20px;
+            margin-top: 4px
         }
 
-        @media (max-width: 768px) {
-            .content-grid {
-                grid-template-columns: 1fr;
+        .muted {
+            color: var(--muted)
+        }
+
+        .main-grid {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 14px
+        }
+
+        .chart-area {
+            height: 420px
+        }
+
+        .leaderboard .item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px;
+            border-radius: 10px;
+            background: linear-gradient(180deg, #fbfdff, #fff);
+            margin-bottom: 10px
+        }
+
+        .leader-left {
+            display: flex;
+            gap: 10px;
+            align-items: center
+        }
+
+        .avatar {
+            width: 44px;
+            height: 44px;
+            border-radius: 10px;
+            background: linear-gradient(90deg, var(--accent), var(--accent-2));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 700
+        }
+
+        .controls-small {
+            display: flex;
+            gap: 8px;
+            align-items: center
+        }
+
+        .time-filter button {
+            padding: 6px 10px;
+            border-radius: 8px;
+            border: none;
+            background: #f1f5f9;
+            cursor: pointer
+        }
+
+        .time-filter button.active {
+            background: var(--accent);
+            color: white
+        }
+
+        .activity-list {
+            max-height: 260px;
+            overflow: auto;
+            padding-right: 8px
+        }
+
+        @media (max-width:980px) {
+            .grid {
+                grid-template-columns: repeat(2, 1fr)
             }
+
+            .main-grid {
+                grid-template-columns: 1fr
+            }
+        }
+
+        /* modal */
+        .modal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(10, 10, 12, 0.35);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 80
+        }
+
+        .modal {
+            background: white;
+            border-radius: 12px;
+            padding: 18px;
+            max-width: 720px;
+            width: 100%;
+            box-shadow: 0 20px 50px rgba(10, 10, 20, 0.2)
+        }
+
+        .modal h3 {
+            margin: 0 0 8px 0
+        }
+
+        .small {
+            font-size: 13px;
+            color: var(--muted)
+        }
+
+        .row {
+            display: flex;
+            gap: 8px;
+            align-items: center
+        }
+
+        .chip {
+            padding: 6px 10px;
+            border-radius: 999px;
+            background: #f1f5f9;
+            font-weight: 600
         }
     </style>
 </head>
 
 <body>
-    <div class="dashboard-container">
-        <!-- Header -->
-        <div class="dashboard-header">
-            <div class="header-left">
-                <h1><i class="fas fa-rocket"></i> Team Performance Dashboard</h1>
-                <p>{{ org_title }} • Tracking {{ total_members }} developers • {{ current_date }}</p>
-            </div>
-        </div>
-
-        <!-- Stats Cards -->
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-icon" style="background: linear-gradient(135deg, #2ecc71, #27ae60);">
-                    <i class="fas fa-code-branch"></i>
-                </div>
-                <div class="stat-content">
-                    <h3>Today's Commits</h3>
-                    <div class="value">{{ today_stats.total_commits }}</div>
-                    <div class="change {{ 'positive' if today_stats.change_percentage >= 0 else 'negative' }}">
-                        <i class="fas fa-arrow-{{ 'up' if today_stats.change_percentage >= 0 else 'down' }}"></i>
-                        {{ today_stats.change_percentage|abs }}% change
-                    </div>
+    <div class="wrap">
+        <header class="top">
+            <div class="brand">
+                <div class="logo"><i class="fas fa-code"></i></div>
+                <div>
+                    <div style="font-weight:800;font-size:18px">{{ org_title }}</div>
+                    <div class="meta">{{ total_members }} members • {{ current_date }} • Week {{ week_number }}</div>
                 </div>
             </div>
 
-            <div class="stat-card">
-                <div class="stat-icon" style="background: linear-gradient(135deg, #3498db, #2980b9);">
-                    <i class="fas fa-file-code"></i>
+            <div class="top-actions">
+                <div class="controls-small">
+                    <button class="button" id="refreshBtn" title="Reload dashboard">⟳ Refresh</button>
+                    <button class="button ghost" id="exportBtn" title="Export current data as CSV">⇩ Export CSV</button>
+                    <button class="button ghost" id="downloadChartBtn" title="Download chart as PNG">🖼 Download
+                        Chart</button>
                 </div>
-                <div class="stat-content">
-                    <h3>Files Changed</h3>
-                    <div class="value">{{ today_stats.files_changed }}</div>
-                    <div class="change {{ 'positive' if today_stats.change_percentage >= 0 else 'negative' }}">
-                        <i class="fas fa-arrow-{{ 'up' if today_stats.change_percentage >= 0 else 'down' }}"></i>
-                        {{ today_stats.change_percentage|abs }}% change
-                    </div>
+                <div style="width:10px"></div>
+                <div class="controls">
+                    <input id="shareLink" type="text" value="{{ request.url }}"
+                        style="padding:8px;border-radius:8px;border:1px solid #eee" />
+                    <button class="button ghost" id="copyLink">Copy</button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Top stats -->
+        <section class="grid">
+            <div class="card stat">
+                <div class="icon" style="background:linear-gradient(90deg,#06b6d4,#0ea5e9)"><i
+                        class="fas fa-calendar-day"></i></div>
+                <div>
+                    <h3>Today — Net Lines</h3>
+                    <div class="val" id="netLinesVal">{{ today_stats.files_added - today_stats.files_removed if
+                        today_stats is not none else 0 }}</div>
+                    <div class="small">Added: <strong id="todayAdded">{{ today_stats.files_added }}</strong> • Removed:
+                        <strong id="todayRemoved">{{ today_stats.files_removed }}</strong></div>
                 </div>
             </div>
 
-            <div class="stat-card">
-                <div class="stat-icon" style="background: linear-gradient(135deg, #9b59b6, #8e44ad);">
-                    <i class="fas fa-users"></i>
-                </div>
-                <div class="stat-content">
-                    <h3>Active Developers</h3>
-                    <div class="value">{{ today_stats.active_developers }}</div>
-                    <div class="change positive">
-                        <i class="fas fa-fire"></i>
-                        {{ today_stats.active_percentage }}% of team
-                    </div>
+            <div class="card stat">
+                <div class="icon" style="background:linear-gradient(90deg,#34d399,#10b981)"><i
+                        class="fas fa-code-branch"></i></div>
+                <div>
+                    <h3>Commits (Today)</h3>
+                    <div class="val">{{ today_stats.total_commits }}</div>
+                    <div class="small">{{ today_stats.active_developers }} active devs</div>
                 </div>
             </div>
 
-            <div class="stat-card">
-                <div class="stat-icon" style="background: linear-gradient(135deg, #e74c3c, #c0392b);">
-                    <i class="fas fa-tachometer-alt"></i>
+            <div class="card stat">
+                <div class="icon" style="background:linear-gradient(90deg,#f97316,#fb923c)"><i class="fas fa-bug"></i>
                 </div>
-                <div class="stat-content">
+                <div>
+                    <h3>Week — Churn</h3>
+                    <div class="val">{{ ( (week_progress.lines_removed / (week_progress.lines_added +
+                        week_progress.lines_removed) )*100 ) | round(1) if (week_progress.lines_added +
+                        week_progress.lines_removed) > 0 else 0 }}%</div>
+                    <div class="small">Churn = deletions / (additions+deletions)</div>
+                </div>
+            </div>
+
+            <div class="card stat">
+                <div class="icon" style="background:linear-gradient(90deg,#7c3aed,#6d28d9)"><i
+                        class="fas fa-tachometer-alt"></i></div>
+                <div>
                     <h3>Team Velocity</h3>
-                    <div class="value">{{ today_stats.velocity_score }}/100</div>
-                    <div class="change {{ 'positive' if today_stats.velocity_change >= 0 else 'negative' }}">
-                        <i class="fas fa-arrow-{{ 'up' if today_stats.velocity_change >= 0 else 'down' }}"></i>
-                        {{ today_stats.velocity_change|abs }} points
+                    <div class="val">{{ today_stats.velocity_score }}/100</div>
+                    <div class="small">{{ today_stats.active_developers }} active — {{ today_stats.active_percentage }}%
+                        participation</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Main -->
+        <section class="main-grid">
+            <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                    <div>
+                        <h3 style="margin:0">Activity — Last 7 days</h3>
+                        <div class="small">Files added / modified / deleted (hover for exact numbers)</div>
+                    </div>
+
+                    <div class="time-filter">
+                        <button class="active" data-range="week">7d</button>
+                        <button data-range="month">30d</button>
+                        <button data-range="quarter">90d</button>
+                        <label style="margin-left:8px" class="small mut ed">Toggle:</label>
+                        <label style="margin-left:8px"><input type="checkbox" id="toggleAdded" checked /> Added</label>
+                        <label style="margin-left:8px"><input type="checkbox" id="toggleModified" checked />
+                            Modified</label>
+                        <label style="margin-left:8px"><input type="checkbox" id="toggleRemoved" checked />
+                            Removed</label>
+                    </div>
+                </div>
+
+                <div class="chart-area">
+                    <canvas id="dailyChart"></canvas>
+                </div>
+
+                <div style="display:flex;gap:12px;margin-top:12px">
+                    <div style="flex:1">
+                        <h4 style="margin:0 0 8px 0">Weekly totals</h4>
+                        <table style="width:100%;border-collapse:collapse">
+                            <tr>
+                                <td class="small muted">Lines added (WTD)</td>
+                                <td style="text-align:right;font-weight:700">{{ week_progress.lines_added }}</td>
+                            </tr>
+                            <tr>
+                                <td class="small muted">Lines removed (WTD)</td>
+                                <td style="text-align:right;font-weight:700">{{ week_progress.lines_removed }}</td>
+                            </tr>
+                            <tr>
+                                <td class="small muted">Net lines (WTD)</td>
+                                <td style="text-align:right;font-weight:700">{{ week_progress.net_lines }}</td>
+                            </tr>
+                            <tr>
+                                <td class="small muted">Commits (WTD)</td>
+                                <td style="text-align:right;font-weight:700">{{ week_progress.commits }}</td>
+                            </tr>
+                        </table>
+                    </div>
+
+                    <div style="width:260px">
+                        <h4 style="margin:0 0 8px 0">Recent activity</h4>
+                        <div class="activity-list">
+                            {% for act in recent_activities %}
+                            <div style="padding:8px;border-radius:8px;background:#fbfdff;margin-bottom:8px">
+                                <div style="font-weight:700">{{ act.title }}</div>
+                                <div class="small muted">{{ act.description }} • {{ act.time }}</div>
+                            </div>
+                            {% else %}
+                            <div class="small muted">No recent activity</div>
+                            {% endfor %}
+                        </div>
                     </div>
                 </div>
             </div>
-        </div>
 
-        <!-- Main Content -->
-        <div class="content-grid">
-            <!-- Left Column -->
-            <div class="left-column">
-                <!-- Daily Tracking Chart -->
-                <div class="chart-container">
-                    <h2><i class="fas fa-chart-bar"></i> Daily Performance Tracking</h2>
-                    <div style="height: 400px; margin-top: 20px;">
-                        <canvas id="dailyChart"></canvas>
+            <!-- Right column -->
+            <aside>
+                <div class="card leaderboard">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                        <div>
+                            <h3 style="margin:0">Weekly Leaderboard</h3>
+                            <div class="small muted">Composite: merges · reviews · issues · CI · cross-team</div>
+                        </div>
+                        <div>
+                            <button class="button ghost" id="explainLeaderboard">What is this?</button>
+                        </div>
                     </div>
-                </div>
-            </div>
 
-            <!-- Right Column - Leaderboard -->
-            <div class="right-column">
-                <div class="leaderboard-container">
-                    <h2><i class="fas fa-crown"></i> Weekly Leaderboard</h2>
-                    <div style="margin-top: 20px;">
+                    <div id="leaderboardList">
                         {% for developer in leaderboard %}
-                        <div class="leaderboard-item">
-                            <div
-                                style="width: 36px; height: 36px; border-radius: 50%; background: {% if loop.index == 1 %}#FFD700{% elif loop.index == 2 %}#C0C0C0{% elif loop.index == 3 %}#CD7F32{% else %}#6c757d{% endif %}; 
-                                        display: flex; align-items: center; justify-content: center; color: white; font-weight: 700;">
-                                {{ loop.index }}
+                        <div class="leaderboard-item" data-index="{{ loop.index0 }}"
+                            data-dev='{{ developer | tojson | safe }}' style="cursor:pointer">
+                            <div class="leader-left">
+                                <div class="avatar">{{ developer.name.split(' ')[0][0] | default('U') }}</div>
+                                <div>
+                                    <div style="font-weight:800">{{ developer.name }}</div>
+                                    <div class="small muted">{{ developer.commits }} commits • {{
+                                        developer.files_changed }} files</div>
+                                </div>
                             </div>
-                            <div style="flex: 1;">
-                                <h4 style="margin: 0; font-size: 1rem;">{{ developer.name }}</h4>
-                                <p style="margin: 5px 0 0 0; font-size: 0.85rem; color: var(--gray);">
-                                    {{ developer.commits }} commits • {{ developer.files_changed }} files
-                                </p>
-                            </div>
-                            <div style="font-weight: 700; font-size: 1.2rem; color: var(--primary);">
-                                {{ developer.score }}
+                            <div style="text-align:right">
+                                <div style="font-weight:900;color:var(--accent)">{{ developer.score }}</div>
+                                <div class="small muted">consistency: {{ developer.consistency }}</div>
                             </div>
                         </div>
+                        {% else %}
+                        <div class="small muted">No contributors this week.</div>
                         {% endfor %}
                     </div>
+
+                    <div style="margin-top:14px;border-top:1px solid #f3f4f6;padding-top:12px">
+                        <h4 style="margin:0 0 6px 0">Top performer</h4>
+                        <div class="small muted">{{ top_performer_message }}</div>
+                    </div>
                 </div>
+
+                <div class="card" style="margin-top:12px">
+                    <h4 style="margin:0 0 8px 0">Quick Insights</h4>
+                    <ul style="margin:8px 0 0 18px;color:var(--muted)">
+                        <li>High churn indicates frequent rewrites — identify files with high deletions.</li>
+                        <li>Low review throughput — encourage pairing, add reviewers in PR templates.</li>
+                        <li>Large PRs increase risk — encourage smaller, focused PRs.</li>
+                    </ul>
+                </div>
+            </aside>
+        </section>
+    </div>
+
+    <!-- Developer modal -->
+    <div id="modal" class="modal-backdrop">
+        <div class="modal" role="dialog" aria-modal="true">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+                <h3 id="modalTitle">Developer</h3>
+                <button id="closeModal" class="button ghost">Close</button>
+            </div>
+            <div id="modalBody" style="margin-top:12px">
+                <!-- populated by JS -->
             </div>
         </div>
     </div>
 
     <script>
-        // Initialize data from template
-        const dailyData = {{ daily_stats| tojson }};
+        // Data from server
+        const daily = {{ daily_stats | tojson }};
+        const leaderboard = {{ leaderboard | tojson }};
+        const todayStats = {{ today_stats | tojson }};
+        const weekTotals = {{ week_progress | tojson }};
+        const topMessage = "{{ top_performer_message }}";
+        // Defensive: ensure arrays exist
+        const labels = daily.labels || [];
+        const added = daily.added || [];
+        const modified = daily.modified || [];
+        const removed = daily.removed || [];
+        // compute net
+        const net = labels.map((_, i) => ((added[i] || 0) - (removed[i] || 0)));
 
-        // Daily Performance Chart
-        const dailyCtx = document.getElementById('dailyChart').getContext('2d');
-        const dailyChart = new Chart(dailyCtx, {
+        // create chart
+        const ctx = document.getElementById('dailyChart').getContext('2d');
+        const dsAdded = { label: 'Files Added', data: added, backgroundColor: 'rgba(34,197,94,0.85)' };
+        const dsModified = { label: 'Files Modified', data: modified, backgroundColor: 'rgba(250,204,21,0.85)' };
+        const dsRemoved = { label: 'Files Deleted', data: removed, backgroundColor: 'rgba(239,68,68,0.85)' };
+        const dsNet = { label: 'Net', data: net, type: 'line', borderColor: '#2563eb', borderWidth: 2, fill: false, yAxisID: 'y' };
+
+        const dailyChart = new Chart(ctx, {
             type: 'bar',
-            data: {
-                labels: dailyData.labels,
-                datasets: [
-                    {
-                        label: 'Lines Added',
-                        data: dailyData.added,
-                        backgroundColor: 'rgba(46, 204, 113, 0.7)',
-                        borderColor: 'rgba(46, 204, 113, 1)',
-                        borderWidth: 2,
-                    },
-                    {
-                        label: 'Lines Removed',
-                        data: dailyData.removed,
-                        backgroundColor: 'rgba(231, 76, 60, 0.7)',
-                        borderColor: 'rgba(231, 76, 60, 1)',
-                        borderWidth: 2,
-                    }
-                ]
-            },
+            data: { labels, datasets: [dsAdded, dsModified, dsRemoved, dsNet] },
             options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: {
-                    legend: {
-                        position: 'top',
-                    }
-                },
-                scales: {
-                    x: {
-                        grid: {
-                            display: false
-                        }
-                    },
-                    y: {
-                        beginAtZero: true,
-                        grid: {
-                            color: 'rgba(0, 0, 0, 0.05)'
-                        }
-                    }
-                }
+                responsive: true, maintainAspectRatio: false,
+                interaction: { mode: 'index', intersect: false },
+                plugins: { legend: { position: 'top' }, tooltip: { callbacks: { label(ctx) { return ctx.dataset.label + ': ' + ctx.parsed.y } } } },
+                scales: { x: { stacked: true }, y: { stacked: false, beginAtZero: true } }
             }
         });
+
+        // toggles
+        document.getElementById('toggleAdded').addEventListener('change', e => {
+            dailyChart.setDatasetVisibility(0, e.target.checked); dailyChart.update();
+        });
+        document.getElementById('toggleModified').addEventListener('change', e => {
+            dailyChart.setDatasetVisibility(1, e.target.checked); dailyChart.update();
+        });
+        document.getElementById('toggleRemoved').addEventListener('change', e => {
+            dailyChart.setDatasetVisibility(2, e.target.checked); dailyChart.update();
+        });
+
+        // download chart
+        document.getElementById('downloadChartBtn').addEventListener('click', () => {
+            const a = document.createElement('a');
+            a.href = dailyChart.toBase64Image();
+            a.download = 'daily-activity.png';
+            a.click();
+        });
+
+        // refresh
+        document.getElementById('refreshBtn').addEventListener('click', () => location.reload());
+
+        // copy dashboard URL
+        document.getElementById('copyLink').addEventListener('click', () => {
+            const inp = document.getElementById('shareLink');
+            inp.select(); inp.setSelectionRange(0, 99999);
+            navigator.clipboard.writeText(inp.value).then(() => { alert('Link copied to clipboard') });
+        });
+
+        // export CSV (daily + leaderboard combined)
+        document.getElementById('exportBtn').addEventListener('click', () => {
+            let csv = 'Day,Added,Modified,Removed,Net\\n';
+            for (let i = 0; i < labels.length; i++) {
+                csv += `${labels[i]},${added[i] || 0},${modified[i] || 0},${removed[i] || 0},${net[i] || 0}\\n`;
+            }
+            csv += '\\nLeader,Commits,Files Changed,Score,Consistency\\n';
+            leaderboard.forEach(dev => {
+                csv += `${dev.name || ''},${dev.commits || 0},${dev.files_changed || 0},${dev.score || 0},${dev.consistency || 0}\\n`;
+            });
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a'); a.href = url; a.download = 'gitsync-export.csv'; a.click();
+            URL.revokeObjectURL(url);
+        });
+
+        // leaderboard click -> show modal with details
+        document.querySelectorAll('#leaderboardList .leaderboard-item').forEach(el => {
+            el.addEventListener('click', () => {
+                const dev = JSON.parse(el.getAttribute('data-dev'));
+                const modal = document.getElementById('modal');
+                const title = document.getElementById('modalTitle');
+                const body = document.getElementById('modalBody');
+                title.textContent = dev.name || 'Developer';
+                // build details (show fields if available)
+                let html = '<div class="row"><div style="flex:1"><div class="small">Commits</div><div style="font-weight:800">' + (dev.commits || 0) + '</div></div><div style="flex:1"><div class="small">Files changed</div><div style="font-weight:800">' + (dev.files_changed || 0) + '</div></div></div>';
+                html += '<div style="margin-top:10px">';
+                html += '<div class="small">Merged PRs: <strong>' + (dev.merged_prs || 0) + '</strong></div>';
+                html += '<div class="small">Reviews done: <strong>' + (dev.reviews_done || 0) + '</strong></div>';
+                html += '<div class="small">Issues closed: <strong>' + (dev.issues_closed || 0) + '</strong></div>';
+                if (dev.ci_pass_rate !== undefined && dev.ci_pass_rate !== null) {
+                    html += '<div class="small">CI pass: <strong>' + Math.round(dev.ci_pass_rate * 100) + '%</strong></div>';
+                }
+                if (dev.extra && typeof dev.extra === 'object') {
+                    html += '<div style="margin-top:8px" class="small">Extra:</div><pre style="background:#f7fafc;padding:8px;border-radius:6px">' + JSON.stringify(dev.extra, null, 2) + '</pre>';
+                }
+                html += '</div>';
+                body.innerHTML = html;
+                modal.style.display = 'flex';
+            });
+        });
+
+        document.getElementById('closeModal').addEventListener('click', () => document.getElementById('modal').style.display = 'none');
+        document.getElementById('modal').addEventListener('click', function (e) { if (e.target === this) this.style.display = 'none' });
+
+        // explain leaderboard
+        document.getElementById('explainLeaderboard').addEventListener('click', () => {
+            alert('Leaderboard is a composite score that weights merged PRs, review throughput, issues closed, CI reliability and consistency over the week. It is tuned for team collaboration and risk reduction.');
+        });
+
+        // small enhancement: update net value in top stat if arrays change
+        function refreshTopNet() {
+            const sumAdded = added.reduce((a, b) => a + (b || 0), 0);
+            const sumRemoved = removed.reduce((a, b) => a + (b || 0), 0);
+            document.getElementById('netLinesVal').textContent = (sumAdded - sumRemoved);
+            document.getElementById('todayAdded').textContent = todayStats.files_added || 0;
+            document.getElementById('todayRemoved').textContent = todayStats.files_removed || 0;
+        }
+        refreshTopNet();
+
+        // auto refresh hint: in prod you'd fetch a JSON endpoint and re-render datasets
     </script>
 </body>
 
