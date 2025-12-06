@@ -796,10 +796,12 @@ def dashboard():
     conn = get_db_connection()
     if not conn:
         return "<h1>Database Error</h1><p>Unable to connect.</p>", 500
+    
     try:
         c = conn.cursor()
         # date boundaries
         today_start_utc, yesterday_start_utc, week_start_utc, now_ist = get_date_boundaries()
+        
         # org title
         c.execute("SELECT repo_name FROM project_updates WHERE chat_id = %s ORDER BY timestamp DESC LIMIT 1", (str(target_chat_id),))
         r = c.fetchone()
@@ -818,6 +820,7 @@ def dashboard():
             SELECT
               COALESCE(SUM(lines_added),0) as lines_added,
               COALESCE(SUM(lines_removed),0) as lines_removed,
+              COALESCE(SUM(files_added + files_modified + files_removed),0) as files_changed,
               COUNT(*) as commits_count,
               COUNT(DISTINCT author) as active_devs
             FROM project_updates
@@ -826,9 +829,31 @@ def dashboard():
         today_row = c.fetchone()
         today_lines_added = int(today_row[0] or 0)
         today_lines_removed = int(today_row[1] or 0)
-        today_commits = int(today_row[2] or 0)
-        today_active_devs = int(today_row[3] or 0)
+        today_files_changed = int(today_row[2] or 0)
+        today_commits = int(today_row[3] or 0)
+        today_active_devs = int(today_row[4] or 0)
         today_net_lines = today_lines_added - today_lines_removed
+
+        # Calculate percentages for today
+        today_active_percentage = round((today_active_devs / max(1, total_developers)) * 100, 1)
+        today_change_percentage = 0
+        # Calculate yesterday's stats for comparison
+        c.execute("""
+            SELECT
+              COALESCE(SUM(lines_added + lines_removed),0) as total_changes,
+              COALESCE(SUM(files_added + files_modified + files_removed),0) as files_changed
+            FROM project_updates
+            WHERE chat_id = %s AND timestamp >= %s AND timestamp < %s
+        """, (str(target_chat_id), yesterday_start_utc, today_start_utc))
+        yesterday_row = c.fetchone()
+        yesterday_total = int(yesterday_row[0] or 0)
+        yesterday_files = int(yesterday_row[1] or 0)
+        
+        today_total = today_lines_added + today_lines_removed
+        if yesterday_total > 0:
+            today_change_percentage = round(((today_total - yesterday_total) / yesterday_total) * 100, 1)
+        elif today_total > 0:
+            today_change_percentage = 100
 
         # 2) Week-to-date totals
         c.execute("""
@@ -849,6 +874,7 @@ def dashboard():
         # 3) Last 7 days daily breakdown
         daily_lines_added = []
         daily_lines_removed = []
+        daily_files_modified = []
         labels = []
         for i in range(6, -1, -1):
             date_ist = now_ist - timedelta(days=i)
@@ -856,13 +882,15 @@ def dashboard():
             day_start_utc = datetime(date_ist.year, date_ist.month, date_ist.day, 0,0,0, tzinfo=IST).astimezone(pytz.UTC)
             day_end_utc = day_start_utc + timedelta(days=1)
             c.execute("""
-                SELECT COALESCE(SUM(lines_added),0), COALESCE(SUM(lines_removed),0)
+                SELECT COALESCE(SUM(lines_added),0), COALESCE(SUM(lines_removed),0), 
+                       COALESCE(SUM(files_modified),0)
                 FROM project_updates
                 WHERE chat_id = %s AND timestamp >= %s AND timestamp < %s
             """, (str(target_chat_id), day_start_utc, day_end_utc))
             rr = c.fetchone()
             daily_lines_added.append(int(rr[0] or 0))
             daily_lines_removed.append(int(rr[1] or 0))
+            daily_files_modified.append(int(rr[2] or 0))
 
         # 4) churn ratio
         churn_ratio = (week_lines_removed / (week_lines_added + week_lines_removed)) if (week_lines_added + week_lines_removed) > 0 else 0.0
@@ -870,8 +898,77 @@ def dashboard():
         # 5) velocity
         velocity_today_per_dev = (today_net_lines / max(1, today_active_devs)) if today_active_devs > 0 else 0
         velocity_week_per_dev = (week_net_lines / max(1, len(developers))) if len(developers) > 0 else 0
+        
+        # Calculate velocity score (0-100)
+        velocity_score = min(100, max(0, round(velocity_week_per_dev / 100 * 100, 0)))  # Normalized to 0-100
+        velocity_change = 0  # Default for now
 
-        # 6) Corporate leaderboard (composite using PRs, reviews, issues, speed, CI, cross-team)
+        # 6) Calculate progress percentages
+        # Today's progress - based on commits vs average
+        avg_daily_commits = week_commits / 7 if week_commits > 0 else 1
+        today_progress = min(100, round((today_commits / avg_daily_commits) * 100, 0))
+        
+        # Weekly progress - based on week vs previous week
+        prev_week_start_utc = week_start_utc - timedelta(weeks=1)
+        c.execute("""
+            SELECT COUNT(*) as commits_count
+            FROM project_updates
+            WHERE chat_id = %s AND timestamp >= %s AND timestamp < %s
+        """, (str(target_chat_id), prev_week_start_utc, week_start_utc))
+        prev_week_row = c.fetchone()
+        prev_week_commits = int(prev_week_row[0] or 0) if prev_week_row else 0
+        week_progress = min(100, round((week_commits / max(1, prev_week_commits)) * 100, 0)) if prev_week_commits > 0 else 100
+        
+        # Sprint progress (simplified - based on week completion)
+        sprint_progress = min(100, round((now_ist.weekday() / 7) * 100, 0))
+
+        # 7) Generate motivation messages
+        motivation_messages = [
+            "Great work team! Keep pushing those commits!",
+            "Every line of code brings us closer to success!",
+            "Teamwork makes the dream work! Keep collaborating!",
+            "Innovation is happening - great job everyone!",
+            "Your hard work is paying off. Keep it up!",
+            "Quality code is being written. Excellent progress!",
+            "The team is on fire today! 🔥"
+        ]
+        
+        top_performer_messages = [
+            "Leading the pack with exceptional contributions!",
+            "Setting the standard for excellence this week!",
+            "MVP material with outstanding performance!",
+            "Consistently delivering top-tier work!",
+            "A true rockstar of the development team!"
+        ]
+
+        motivation_title = random.choice(["🚀 Amazing Progress!", "⭐ Team Excellence", "💪 Outstanding Work"])
+        motivation_message = random.choice(motivation_messages)
+        top_performer_message = random.choice(top_performer_messages)
+
+        # 8) Generate recent activities
+        recent_activities = []
+        c.execute("""
+            SELECT author, repo_name, branch_name, summary, timestamp
+            FROM project_updates
+            WHERE chat_id = %s
+            ORDER BY timestamp DESC
+            LIMIT 10
+        """, (str(target_chat_id),))
+        
+        activity_icons = ["fas fa-code", "fas fa-file-code", "fas fa-terminal", "fas fa-bug", "fas fa-check-circle"]
+        activity_colors = ["#4361ee", "#4cc9f0", "#f72585", "#7209b7", "#3a0ca3"]
+        
+        for i, row in enumerate(c.fetchall()):
+            activity = {
+                'title': f"{row[0]} pushed to {row[1]}",
+                'description': row[3][:50] + "..." if len(row[3]) > 50 else row[3],
+                'time': row[4].astimezone(IST).strftime('%I:%M %p'),
+                'icon': activity_icons[i % len(activity_icons)],
+                'color': activity_colors[i % len(activity_colors)]
+            }
+            recent_activities.append(activity)
+
+        # 9) Corporate leaderboard (composite using PRs, reviews, issues, speed, CI, cross-team)
         period_start = week_start_utc
 
         # merged PRs
@@ -883,11 +980,11 @@ def dashboard():
 
         # reviews
         c.execute("""SELECT reviewer AS author, COUNT(*) AS reviews_done,
-                            SUM(CASE WHEN state='APPROVED' THEN 1 ELSE 0 END) AS approvals
-                     FROM pr_reviews r
-                     JOIN pull_requests p ON r.pr_id = p.id
-                     WHERE r.submitted_at >= %s
-                     GROUP BY reviewer""", (period_start,))
+                    SUM(CASE WHEN r.state='APPROVED' THEN 1 ELSE 0 END) AS approvals
+            FROM pr_reviews r
+            JOIN pull_requests p ON r.pr_id = p.id
+            WHERE r.submitted_at >= %s
+            GROUP BY reviewer""", (period_start,))
         review_rows = {r[0]: {'reviews_done': int(r[1]), 'approvals': int(r[2])} for r in c.fetchall()}
 
         # issues closed
@@ -934,7 +1031,15 @@ def dashboard():
                      GROUP BY r.reviewer""", (period_start,))
         cross_rows = {r[0]: int(r[1]) for r in c.fetchall()}
 
-        authors = set(merged_rows) | set(review_rows) | set(issue_rows) | set(first_review_rows) | set(merge_time_rows) | set(ci_rows) | set(cross_rows)
+        # Also get commit stats for leaderboard
+        c.execute("""SELECT author, COUNT(*) as commits, 
+                            SUM(files_added + files_modified + files_removed) as files_changed
+                     FROM project_updates
+                     WHERE chat_id = %s AND timestamp >= %s
+                     GROUP BY author""", (str(target_chat_id), period_start))
+        commit_stats = {r[0]: {'commits': int(r[1] or 0), 'files_changed': int(r[2] or 0)} for r in c.fetchall()}
+
+        authors = set(merged_rows) | set(review_rows) | set(issue_rows) | set(first_review_rows) | set(merge_time_rows) | set(ci_rows) | set(cross_rows) | set(commit_stats.keys())
 
         metrics = {}
         for a in authors:
@@ -947,7 +1052,9 @@ def dashboard():
                 'avg_first_review_secs': first_review_rows.get(a, None),
                 'avg_merge_secs': merge_time_rows.get(a, None),
                 'ci_pass_rate': (ci_rows.get(a, {}).get('passed',0) / max(1, ci_rows.get(a, {}).get('total',0))) if ci_rows.get(a) else None,
-                'cross_reviews': cross_rows.get(a, 0)
+                'cross_reviews': cross_rows.get(a, 0),
+                'commits': commit_stats.get(a, {}).get('commits', 0),
+                'files_changed': commit_stats.get(a, {}).get('files_changed', 0)
             }
 
         def normalize_map(vals):
@@ -962,6 +1069,8 @@ def dashboard():
         reviews_map = {a: metrics[a]['reviews_done'] for a in authors}
         issues_map = {a: metrics[a]['issues_closed'] for a in authors}
         cross_map = {a: metrics[a]['cross_reviews'] for a in authors}
+        commits_map = {a: metrics[a]['commits'] for a in authors}
+        files_map = {a: metrics[a]['files_changed'] for a in authors}
         first_review_map = {a: (metrics[a]['avg_first_review_secs'] if metrics[a]['avg_first_review_secs'] else None) for a in authors}
         merge_time_map = {a: (metrics[a]['avg_merge_secs'] if metrics[a]['avg_merge_secs'] else None) for a in authors}
         ci_map = {a: (metrics[a]['ci_pass_rate'] if metrics[a]['ci_pass_rate'] is not None else 0.0) for a in authors}
@@ -970,6 +1079,8 @@ def dashboard():
         n_reviews = normalize_map(reviews_map)
         n_issues = normalize_map(issues_map)
         n_cross = normalize_map(cross_map)
+        n_commits = normalize_map(commits_map)
+        n_files = normalize_map(files_map)
         n_ci = normalize_map(ci_map)
 
         def normalize_time_map(time_map):
@@ -992,11 +1103,13 @@ def dashboard():
         n_merge_time = normalize_time_map(merge_time_map)
 
         weights = {
-            'merged_prs': 0.30,
-            'reviews': 0.20,
-            'issues': 0.12,
-            'first_review_speed': 0.10,
-            'merge_speed': 0.08,
+            'merged_prs': 0.20,
+            'reviews': 0.15,
+            'issues': 0.10,
+            'commits': 0.15,
+            'files': 0.10,
+            'first_review_speed': 0.08,
+            'merge_speed': 0.07,
             'ci': 0.10,
             'cross_reviews': 0.05
         }
@@ -1007,6 +1120,8 @@ def dashboard():
             score += weights['merged_prs'] * n_merged.get(a, 0.0)
             score += weights['reviews'] * n_reviews.get(a, 0.0)
             score += weights['issues'] * n_issues.get(a, 0.0)
+            score += weights['commits'] * n_commits.get(a, 0.0)
+            score += weights['files'] * n_files.get(a, 0.0)
             score += weights['first_review_speed'] * n_first_review.get(a, 0.0)
             score += weights['merge_speed'] * n_merge_time.get(a, 0.0)
             score += weights['ci'] * n_ci.get(a, 0.0)
@@ -1015,6 +1130,8 @@ def dashboard():
             leaderboard.append({
                 'name': a,
                 'score': round(score * 100, 2),
+                'commits': metrics[a]['commits'],
+                'files_changed': metrics[a]['files_changed'],
                 'merged_prs': metrics[a]['merged_prs'],
                 'reviews_done': metrics[a]['reviews_done'],
                 'issues_closed': metrics[a]['issues_closed'],
@@ -1030,19 +1147,26 @@ def dashboard():
             'current_date': now_ist.strftime('%B %d, %Y'),
             'week_number': now_ist.isocalendar()[1],
             'today_stats': {
+                'total_commits': today_commits,
+                'files_changed': today_files_changed,
                 'lines_added': today_lines_added,
                 'lines_removed': today_lines_removed,
                 'net_lines': today_net_lines,
                 'commits': today_commits,
                 'active_developers': today_active_devs,
-                'velocity_per_dev': round(velocity_today_per_dev,1),
-                'confidence_exact': (today_lines_added+today_lines_removed+week_lines_changed)>0
+                'active_percentage': today_active_percentage,
+                'change_percentage': today_change_percentage,
+                'velocity_per_dev': round(velocity_today_per_dev, 1),
+                'velocity_score': velocity_score,
+                'velocity_change': velocity_change,
+                'confidence_exact': (today_lines_added + today_lines_removed + week_lines_changed) > 0
             },
             'daily_stats': {
                 'labels': labels,
                 'added': daily_lines_added,
                 'removed': daily_lines_removed,
-                'net': [daily_lines_added[i]-daily_lines_removed[i] for i in range(7)]
+                'modified': daily_files_modified,
+                'net': [daily_lines_added[i] - daily_lines_removed[i] for i in range(7)]
             },
             'leaderboard': leaderboard,
             'week_progress': {
@@ -1051,8 +1175,16 @@ def dashboard():
                 'net_lines': week_net_lines,
                 'commits': week_commits,
                 'lines_changed': week_lines_changed,
-                'churn_ratio': round(churn_ratio,3)
-            }
+                'churn_ratio': round(churn_ratio, 3),
+                'change_percentage': today_change_percentage  # Use today's change for now
+            },
+            'today_progress': today_progress,
+            'week_progress_pct': week_progress,
+            'sprint_progress': sprint_progress,
+            'motivation_title': motivation_title,
+            'motivation_message': motivation_message,
+            'top_performer_message': top_performer_message,
+            'recent_activities': recent_activities
         }
 
         conn.close()
