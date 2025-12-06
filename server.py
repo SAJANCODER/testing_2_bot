@@ -12,6 +12,8 @@ import sys
 import html
 import traceback
 from dashboard_generator import generate_dashboard_html
+import json
+from collections import defaultdict
 
 executor = ThreadPoolExecutor(max_workers=5)
 
@@ -332,27 +334,266 @@ def telegram_commands():
 
     return jsonify({"status": "ok"}), 200
 
+
+
+# --- 📊 ENHANCED DASHBOARD ROUTE ---
 @app.route('/dashboard', methods=['GET'])
 def dashboard():
     secret_key = request.args.get('key')
     if not secret_key:
         return "<h1>401 Unauthorized</h1><p>Access denied.</p>", 401
-
+    
     target_chat_id = get_chat_id_from_secret(secret_key)
     if not target_chat_id:
         return "<h1>401 Unauthorized</h1><p>Invalid dashboard key.</p>", 401
-
+    
     conn = get_db_connection()
-    if not conn:
-        return "<h1>500 Database Error</h1><p>Could not connect to database.</p>", 500
-
+    if not conn: return "Database Error", 500
+    
     try:
-        html_output = generate_dashboard_html(target_chat_id, conn)
-        return html_output
+        c = conn.cursor()
+        
+        # Get current date info
+        now_utc = datetime.utcnow()
+        IST_OFFSET = timedelta(hours=5, minutes=30)
+        now_ist = now_utc + IST_OFFSET
+        
+        today_start = (now_ist.replace(hour=0, minute=0, second=0, microsecond=0) - IST_OFFSET)
+        yesterday_start = today_start - timedelta(days=1)
+        week_start = today_start - timedelta(days=now_ist.weekday())
+        
+        # 1. Fetch all commits for this chat
+        c.execute("""
+            SELECT author, files_added, files_modified, files_removed, 
+                   timestamp, repo_name, summary
+            FROM project_updates 
+            WHERE chat_id = %s 
+            ORDER BY timestamp DESC
+        """, (str(target_chat_id),))
+        all_commits = c.fetchall()
+        
+        # 2. Get organization name
+        c.execute("""
+            SELECT repo_name FROM project_updates 
+            WHERE chat_id = %s 
+            ORDER BY id DESC LIMIT 1
+        """, (str(target_chat_id),))
+        repo_result = c.fetchone()
+        org_title = repo_result[0] if repo_result and repo_result[0] else "Development Team"
+        
+        # 3. Calculate metrics
+        today_stats = {
+            'total_commits': 0,
+            'files_added': 0,
+            'files_modified': 0,
+            'files_removed': 0,
+            'files_changed': 0,
+            'active_developers': set(),
+            'developers': []
+        }
+        
+        yesterday_stats = {
+            'total_commits': 0,
+            'files_changed': 0,
+            'developers': set()
+        }
+        
+        week_stats = defaultdict(lambda: {
+            'commits': 0,
+            'added': 0,
+            'modified': 0,
+            'removed': 0,
+            'score': 0
+        })
+        
+        daily_stats = {
+            'labels': [],
+            'added': [],
+            'modified': [],
+            'removed': []
+        }
+        
+        # Initialize last 7 days
+        for i in range(6, -1, -1):
+            date = now_ist - timedelta(days=i)
+            daily_stats['labels'].append(date.strftime('%a'))
+            daily_stats['added'].append(0)
+            daily_stats['modified'].append(0)
+            daily_stats['removed'].append(0)
+        
+        recent_activities = []
+        developer_scores = defaultdict(int)
+        
+        for commit in all_commits:
+            author = commit[0]
+            added = commit[1] or 0
+            modified = commit[2] or 0
+            removed = commit[3] or 0
+            timestamp = commit[4]
+            repo = commit[5]
+            summary = commit[6]
+            
+            # Convert timestamp to IST
+            commit_time_ist = timestamp + IST_OFFSET
+            commit_date_str = commit_time_ist.strftime('%Y-%m-%d')
+            day_of_week = commit_time_ist.weekday()
+            
+            # Calculate score for leaderboard (weighted: added > modified > removed)
+            score = (added * 3) + (modified * 2) + (removed * 1)
+            developer_scores[author] += score
+            
+            # Today's commits
+            if timestamp >= today_start:
+                today_stats['total_commits'] += 1
+                today_stats['files_added'] += added
+                today_stats['files_modified'] += modified
+                today_stats['files_removed'] += removed
+                today_stats['files_changed'] += (added + modified + removed)
+                today_stats['active_developers'].add(author)
+                
+                # Add to recent activities
+                if len(recent_activities) < 10:
+                    activity_types = [
+                        {'icon': 'fas fa-plus-circle', 'color': '#2ecc71', 'title': 'Files Added'},
+                        {'icon': 'fas fa-edit', 'color': '#f1c40f', 'title': 'Files Modified'},
+                        {'icon': 'fas fa-minus-circle', 'color': '#e74c3c', 'title': 'Files Removed'},
+                        {'icon': 'fas fa-code', 'color': '#3498db', 'title': 'Code Commit'},
+                        {'icon': 'fas fa-bug', 'color': '#9b59b6', 'title': 'Bug Fix'}
+                    ]
+                    import random
+                    activity = random.choice(activity_types)
+                    
+                    recent_activities.append({
+                        'title': f"{author} {activity['title'].lower()}",
+                        'description': f"{added} added, {modified} modified in {repo}" if added or modified else f"Cleaned up {removed} files",
+                        'icon': activity['icon'],
+                        'color': activity['color'],
+                        'time': commit_time_ist.strftime('%I:%M %p')
+                    })
+            
+            # Yesterday's commits
+            elif yesterday_start <= timestamp < today_start:
+                yesterday_stats['total_commits'] += 1
+                yesterday_stats['files_changed'] += (added + modified + removed)
+                yesterday_stats['developers'].add(author)
+            
+            # This week's commits (for leaderboard)
+            if timestamp >= week_start:
+                week_stats[author]['commits'] += 1
+                week_stats[author]['added'] += added
+                week_stats[author]['modified'] += modified
+                week_stats[author]['removed'] += removed
+                week_stats[author]['score'] += score
+            
+            # Fill daily stats for chart (last 7 days)
+            days_ago = (now_ist.date() - commit_time_ist.date()).days
+            if 0 <= days_ago <= 6:
+                idx = 6 - days_ago
+                daily_stats['added'][idx] += added
+                daily_stats['modified'][idx] += modified
+                daily_stats['removed'][idx] += removed
+        
+        # Calculate percentages and changes
+        today_stats['active_developers'] = len(today_stats['active_developers'])
+        total_developers = len(set([c[0] for c in all_commits]))
+        today_stats['active_percentage'] = round((today_stats['active_developers'] / max(total_developers, 1)) * 100)
+        
+        # Calculate velocity score (0-100)
+        velocity_base = min(today_stats['files_changed'] * 2, 100)
+        team_factor = min((today_stats['active_developers'] / max(total_developers, 1)) * 50, 50)
+        today_stats['velocity_score'] = min(velocity_base + team_factor, 100)
+        
+        # Calculate changes from yesterday
+        yesterday_files = yesterday_stats['files_changed']
+        if yesterday_files > 0:
+            change = ((today_stats['files_changed'] - yesterday_files) / yesterday_files) * 100
+            today_stats['change_percentage'] = round(change, 1)
+            today_stats['files_change_percentage'] = round(change, 1)
+        else:
+            today_stats['change_percentage'] = 100 if today_stats['files_changed'] > 0 else 0
+            today_stats['files_change_percentage'] = 100 if today_stats['files_changed'] > 0 else 0
+        
+        # Velocity change (placeholder - would compare with previous day)
+        today_stats['velocity_change'] = 5  # Positive by default
+        
+        # Create leaderboard
+        leaderboard = []
+        for author, stats in week_stats.items():
+            leaderboard.append({
+                'name': author,
+                'commits': stats['commits'],
+                'files_changed': stats['added'] + stats['modified'] + stats['removed'],
+                'score': stats['score']
+            })
+        
+        # Sort leaderboard by score
+        leaderboard.sort(key=lambda x: x['score'], reverse=True)
+        leaderboard = leaderboard[:10]  # Top 10
+        
+        # Calculate progress percentages
+        target_per_day = 10  # Target files changed per day
+        today_progress = min(round((today_stats['files_changed'] / target_per_day) * 100), 100)
+        
+        target_per_week = target_per_day * 5  # Weekly target
+        week_files = sum(daily_stats['added']) + sum(daily_stats['modified']) + sum(daily_stats['removed'])
+        week_progress = min(round((week_files / target_per_week) * 100), 100)
+        
+        # Sprint progress (simulated)
+        sprint_progress = min(week_progress + 20, 100)
+        
+        # Motivation messages
+        motivation_messages = [
+            "🚀 You're on fire! Keep up the momentum!",
+            "🔥 Amazing work today! The team is crushing it!",
+            "💪 Strong performance! Let's keep pushing forward!",
+            "🌟 Stellar contributions! You're making great progress!",
+            "⚡ Lightning fast development! Impressive velocity!",
+            "🎯 Right on target! Team coordination is excellent!"
+        ]
+        
+        top_performer_messages = [
+            "is leading the charge with exceptional contributions!",
+            "is setting the pace with outstanding commits!",
+            "is dominating the leaderboard this week!",
+            "is showing everyone how it's done!",
+            "is the MVP of the week with consistent performance!"
+        ]
+        
+        
+        motivation_title = random.choice(["Team Momentum", "Performance Peak", "Development Sprint"])
+        motivation_message = random.choice(motivation_messages)
+        top_performer_message = random.choice(top_performer_messages)
+        
+        # Prepare template data
+        template_data = {
+            'org_title': org_title,
+            'total_members': total_developers,
+            'current_date': now_ist.strftime('%B %d, %Y'),
+            'week_number': now_ist.isocalendar()[1],
+            'today_stats': today_stats,
+            'yesterday_stats': yesterday_stats,
+            'daily_stats': daily_stats,
+            'leaderboard': leaderboard,
+            'today_progress': today_progress,
+            'week_progress': week_progress,
+            'sprint_progress': sprint_progress,
+            'recent_activities': recent_activities,
+            'motivation_title': motivation_title,
+            'motivation_message': motivation_message,
+            'top_performer_message': top_performer_message
+        }
+        
+        # Render template
+        from flask import render_template_string
+        with open('templates/dashboard.html', 'r') as f:
+            template = f.read()
+        
+        return render_template_string(template, **template_data)
+        
     except Exception as e:
-        print(f"❌ Dashboard generation error: {e}")
+        print(f"❌ Dashboard Error: {e}")
         traceback.print_exc()
-        return f"<h1>Error</h1><p>Dashboard generation failed: {e}</p>", 500
+        return f"Dashboard Error: {e}", 500
     finally:
         conn.close()
 
