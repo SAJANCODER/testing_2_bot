@@ -1,5 +1,6 @@
+# GitSync final server file (copy-paste)
 import google.generativeai as genai
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify, redirect, render_template_string
 from dotenv import load_dotenv
 import os
 import requests
@@ -14,49 +15,51 @@ import traceback
 import pytz
 import json
 from collections import defaultdict
-import random  # Added missing import
+import random
+from cryptography.fernet import Fernet
+from psycopg2.extras import RealDictCursor
 
 # Initialize thread pool
 executor = ThreadPoolExecutor(max_workers=5)
 
-# 1. Load Environment Variables
+# Load env
 load_dotenv()
 
-# 2. Initialize Flask App
 app = Flask(__name__)
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 TELEGRAM_BOT_TOKEN_FOR_COMMANDS = os.getenv("TELEGRAM_BOT_TOKEN_FOR_COMMANDS")
 APP_BASE_URL = os.getenv("APP_BASE_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 MODEL_NAME = 'gemini-2.5-pro'
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+BOT_USERNAME = os.getenv("BOT_USERNAME")
+FERNET_KEY = os.getenv("FERNET_KEY")
+fernet = Fernet(FERNET_KEY.encode()) if FERNET_KEY else None
 
-# --- SYSTEM SETUP ---
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
 
-# Set timezone
 IST = pytz.timezone('Asia/Kolkata')
 
-# --- DATABASE CONNECTION ---
+# --- DB ---
 def get_db_connection():
     try:
         conn = psycopg2.connect(DATABASE_URL)
         return conn
     except Exception as e:
-        print(f"❌ DATABASE CONNECTION ERROR: {e}", file=sys.stderr)
+        print("DB connection error:", e, file=sys.stderr)
         return None
 
-# --- DATABASE INIT (AUTO-MIGRATION) ---
 def init_db():
     conn = get_db_connection()
-    if not conn: return
+    if not conn:
+        print("❌ DB not available for init.")
+        return
     try:
         c = conn.cursor()
-
-        # 1. Create base table
+        # project_updates
         c.execute('''
             CREATE TABLE IF NOT EXISTS project_updates (
                 id SERIAL PRIMARY KEY,
@@ -66,21 +69,15 @@ def init_db():
                 branch_name TEXT,
                 summary TEXT,
                 files_changed INTEGER DEFAULT 0,
+                files_added INTEGER DEFAULT 0,
+                files_modified INTEGER DEFAULT 0,
+                files_removed INTEGER DEFAULT 0,
+                lines_added INTEGER DEFAULT 0,
+                lines_removed INTEGER DEFAULT 0,
                 timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-
-        # 2. AUTO-MIGRATION: Add new columns if they don't exist
-        try:
-            c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS repo_name TEXT;")
-            c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS branch_name TEXT;")
-            c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS files_added INTEGER DEFAULT 0;")
-            c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS files_modified INTEGER DEFAULT 0;")
-            c.execute("ALTER TABLE project_updates ADD COLUMN IF NOT EXISTS files_removed INTEGER DEFAULT 0;")
-        except Exception as e:
-            print(f"⚠️ Migration notice: {e}")
-
-        # 3. Webhooks table
+        # webhooks
         c.execute('''
             CREATE TABLE IF NOT EXISTS webhooks (
                 secret_key TEXT PRIMARY KEY,
@@ -88,30 +85,107 @@ def init_db():
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # tokens
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS github_tokens (
+                chat_id TEXT PRIMARY KEY,
+                encrypted_token TEXT NOT NULL,
+                created_by TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # pending requests
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS pending_token_requests (
+                request_id TEXT PRIMARY KEY,
+                secret_key TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # processed commits
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS processed_commits (
+                commit_sha TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                repo_name TEXT,
+                processed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (commit_sha, chat_id)
+            )
+        ''')
+        # pull requests & reviews & issues & ci
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS pull_requests (
+              id BIGINT PRIMARY KEY,
+              chat_id TEXT,
+              repo_name TEXT,
+              number INTEGER,
+              author TEXT,
+              created_at TIMESTAMP WITH TIME ZONE,
+              merged_at TIMESTAMP WITH TIME ZONE,
+              closed_at TIMESTAMP WITH TIME ZONE,
+              state TEXT,
+              additions INTEGER DEFAULT 0,
+              deletions INTEGER DEFAULT 0,
+              changed_files INTEGER DEFAULT 0
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS pr_reviews (
+              id BIGINT PRIMARY KEY,
+              pr_id BIGINT REFERENCES pull_requests(id),
+              reviewer TEXT,
+              state TEXT,
+              submitted_at TIMESTAMP WITH TIME ZONE
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS issues_closed (
+              id BIGINT PRIMARY KEY,
+              repo_name TEXT,
+              number INTEGER,
+              author TEXT,
+              closed_by TEXT,
+              created_at TIMESTAMP WITH TIME ZONE,
+              closed_at TIMESTAMP WITH TIME ZONE,
+              labels TEXT[]
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS ci_results (
+              id BIGINT PRIMARY KEY,
+              pr_id BIGINT REFERENCES pull_requests(id),
+              status TEXT,
+              started_at TIMESTAMP WITH TIME ZONE,
+              finished_at TIMESTAMP WITH TIME ZONE
+            )
+        ''')
+        c.execute("CREATE INDEX IF NOT EXISTS idx_updates_chat_time ON project_updates (chat_id, timestamp DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_webhooks_secret ON webhooks (secret_key)")
         conn.commit()
-        print("✅ PostgreSQL tables initialized & migrated!")
+        print("✅ DB initialized.")
     except Exception as e:
-        print(f"❌ Error during DB initialization: {e}")
+        print("init_db error:", e)
+        traceback.print_exc()
     finally:
         conn.close()
 
-# --- DATABASE OPERATIONS ---
-def save_to_db(chat_id, author, repo_name, branch_name, summary, added, modified, removed):
+# --- DB helpers (tokens/pending/processed) ---
+def save_to_db(chat_id, author, repo_name, branch_name, summary, added, modified, removed, lines_added=0, lines_removed=0):
     conn = get_db_connection()
     if not conn: return
     try:
         c = conn.cursor()
-        # Calculate total files changed for legacy compatibility
         total_files = added + modified + removed
-
         c.execute("""
             INSERT INTO project_updates 
-            (chat_id, author, repo_name, branch_name, summary, files_changed, files_added, files_modified, files_removed, timestamp) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-        """, (str(chat_id), author, repo_name, branch_name, summary, total_files, added, modified, removed))
+            (chat_id, author, repo_name, branch_name, summary, files_changed, files_added, files_modified, files_removed, lines_added, lines_removed, timestamp) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        """, (str(chat_id), author, repo_name, branch_name, summary, total_files, added, modified, removed, lines_added, lines_removed))
         conn.commit()
     except Exception as e:
-        print(f"❌ Error saving to updates table: {e}")
+        print("save_to_db error:", e)
     finally:
         conn.close()
 
@@ -123,13 +197,11 @@ def save_webhook_config(chat_id, secret_key):
         c.execute("""
             INSERT INTO webhooks (secret_key, chat_id)
             VALUES (%s, %s)
-            ON CONFLICT (chat_id)
-            DO UPDATE SET secret_key = EXCLUDED.secret_key
+            ON CONFLICT (chat_id) DO UPDATE SET secret_key = EXCLUDED.secret_key
         """, (secret_key, str(chat_id)))
         conn.commit()
-        print(f"🔑 Saved/Updated webhook config for chat {chat_id}.")
     except Exception as e:
-        print(f"❌ Error saving webhook config: {e}")
+        print("save_webhook_config error:", e)
     finally:
         conn.close()
 
@@ -139,10 +211,10 @@ def get_chat_id_from_secret(secret_key):
     try:
         c = conn.cursor()
         c.execute("SELECT chat_id FROM webhooks WHERE secret_key = %s", (secret_key,))
-        result = c.fetchone()
-        return result[0] if result else None
+        r = c.fetchone()
+        return r[0] if r else None
     except Exception as e:
-        print(f"❌ Error retrieving chat ID: {e}")
+        print("get_chat_id_from_secret error:", e)
         return None
     finally:
         conn.close()
@@ -153,19 +225,150 @@ def get_secret_from_chat_id(chat_id):
     try:
         c = conn.cursor()
         c.execute("SELECT secret_key FROM webhooks WHERE chat_id = %s", (str(chat_id),))
-        result = c.fetchone()
-        return result[0] if result else None
+        r = c.fetchone()
+        return r[0] if r else None
     except Exception as e:
-        print(f"❌ Error retrieving secret key: {e}")
+        print("get_secret_from_chat_id error:", e)
         return None
     finally:
         conn.close()
 
-# --- AI & TELEGRAM FUNCTIONS ---
+# tokens
+def save_encrypted_token_for_chat(chat_id, plaintext_token, created_by=None):
+    if not fernet:
+        print("FERNET_KEY missing")
+        return False
+    enc = fernet.encrypt(plaintext_token.encode()).decode()
+    conn = get_db_connection()
+    if not conn: return False
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO github_tokens (chat_id, encrypted_token, created_by)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (chat_id) DO UPDATE SET encrypted_token = EXCLUDED.encrypted_token, created_by = EXCLUDED.created_by, created_at = NOW()
+        """, (str(chat_id), enc, created_by))
+        conn.commit()
+        return True
+    except Exception as e:
+        print("save_encrypted_token error:", e)
+        return False
+    finally:
+        conn.close()
+
+def get_decrypted_token_for_chat(chat_id):
+    if not fernet:
+        return None
+    conn = get_db_connection()
+    if not conn: return None
+    try:
+        c = conn.cursor()
+        c.execute("SELECT encrypted_token FROM github_tokens WHERE chat_id = %s", (str(chat_id),))
+        r = c.fetchone()
+        if not r: return None
+        enc = r[0]
+        try:
+            return fernet.decrypt(enc.encode()).decode()
+        except Exception as e:
+            print("decrypt token error:", e)
+            return None
+    finally:
+        conn.close()
+
+def get_token_creator_for_chat(chat_id):
+    conn = get_db_connection()
+    if not conn: return None
+    try:
+        c = conn.cursor()
+        c.execute("SELECT created_by FROM github_tokens WHERE chat_id = %s", (str(chat_id),))
+        r = c.fetchone()
+        return r[0] if r else None
+    finally:
+        conn.close()
+
+def remove_token_for_chat(chat_id):
+    conn = get_db_connection()
+    if not conn: return False
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM github_tokens WHERE chat_id = %s", (str(chat_id),))
+        conn.commit()
+        return True
+    except Exception as e:
+        print("remove_token error:", e)
+        return False
+    finally:
+        conn.close()
+
+def create_pending_request(secret_key, user_id, chat_id):
+    conn = get_db_connection()
+    if not conn: return None
+    try:
+        c = conn.cursor()
+        request_uuid = str(uuid.uuid4())
+        c.execute("""
+            INSERT INTO pending_token_requests (request_id, secret_key, user_id, chat_id, created_at)
+            VALUES (%s, %s, %s, %s, NOW())
+        """, (request_uuid, secret_key, str(user_id), str(chat_id)))
+        conn.commit()
+        return request_uuid
+    except Exception as e:
+        print("create_pending_request error:", e)
+        return None
+    finally:
+        conn.close()
+
+def get_pending_request_by_user(user_id, expiry_minutes=15):
+    conn = get_db_connection()
+    if not conn: return None
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT secret_key, chat_id, created_at FROM pending_token_requests
+            WHERE user_id = %s
+            ORDER BY created_at DESC LIMIT 1
+        """, (str(user_id),))
+        r = c.fetchone()
+        if not r:
+            return None
+        secret_key, chat_id, created_at = r
+        age = (datetime.utcnow().replace(tzinfo=pytz.UTC) - created_at).total_seconds()
+        if age > expiry_minutes * 60:
+            c.execute("DELETE FROM pending_token_requests WHERE user_id = %s", (str(user_id),))
+            conn.commit()
+            return None
+        return {'secret_key': secret_key, 'chat_id': chat_id}
+    except Exception as e:
+        print("get_pending_request error:", e)
+        return None
+    finally:
+        conn.close()
+
+def clear_pending_request_by_user(user_id):
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM pending_token_requests WHERE user_id = %s", (str(user_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
+# processed commits helpers
+def is_commit_processed(conn, sha, chat_id):
+    with conn.cursor() as c:
+        c.execute("SELECT 1 FROM processed_commits WHERE commit_sha=%s AND chat_id=%s", (sha, str(chat_id)))
+        return c.fetchone() is not None
+
+def mark_commit_processed(conn, sha, chat_id, repo):
+    with conn.cursor() as c:
+        c.execute("INSERT INTO processed_commits (commit_sha, chat_id, repo_name) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING", (sha, str(chat_id), repo))
+    conn.commit()
+
+# --- AI & TELEGRAM ---
 def generate_ai_analysis(commit_data, files_changed):
     commit_msg = commit_data.get('message', 'No message.')
     input_text = f"COMMIT MESSAGE: {commit_msg}\nFILES CHANGED: {', '.join(files_changed)}"
-
     prompt = f"""
     You are an AI Code Reviewer. Analyze this commit data.
     COMMIT DATA: {input_text}
@@ -192,221 +395,290 @@ def generate_ai_analysis(commit_data, files_changed):
 def send_to_telegram(text, author, repo, branch, target_bot_token, target_chat_id):
     if not target_bot_token or not target_chat_id: return
     try:
-        # CLEANUP
         clean_text = text.replace("```html", "").replace("```", "")
         clean_text = clean_text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
         clean_text = clean_text.replace("<ul>", "").replace("</ul>", "")
         clean_text = clean_text.replace("<ol>", "").replace("</ol>", "")
         clean_text = clean_text.replace("<li>", "• ").replace("</li>", "\n")
         clean_text = clean_text.replace("<p>", "").replace("</p>", "\n\n")
-
         now_utc = datetime.utcnow()
         ist_time = now_utc.astimezone(IST)
         display_timestamp = ist_time.strftime('%I:%M %p')
-        
-        # Header with Repo and Branch
         header = (
             f"👤 <b>{html.escape(author)}</b>\n"
             f"📂 <b>{html.escape(repo)}</b> (<code>{html.escape(branch)}</code>)\n"
             f"🕒 {display_timestamp}"
         )
         message_text = f"{header}\n\n{clean_text}"
-
-        payload = {
-            "chat_id": target_chat_id,
-            "text": message_text,
-            "parse_mode": "HTML"
-        }
-        
+        payload = {"chat_id": target_chat_id, "text": message_text, "parse_mode": "HTML"}
         url = TELEGRAM_API_URL.format(token=target_bot_token)
         r = requests.post(url, json=payload)
-        
         if r.status_code != 200:
-             print(f"❌ Telegram Delivery FAILED. Status: {r.status_code}. Response: {r.text}")
+            print("Telegram send failed:", r.status_code, r.text)
     except Exception as e:
-        print(f"❌ Error sending to Telegram: {e}")
+        print("send_to_telegram error:", e)
 
-# --- WEBHOOK PROCESSOR ---
-def process_standup_task(target_bot_token, target_chat_id, author_name, data):
+# --- GitHub helpers ---
+def validate_github_token(token):
     try:
-        all_updates = []
-        commits = data.get('commits', [])
-
-        repo_name = data.get('repository', {}).get('name', 'Unknown Repo')
-        org_name = data.get('repository', {}).get('organization', 'Unknown Org')
-        if isinstance(org_name, dict): org_name = org_name.get('login', 'Unknown')
-        
-        display_repo_name = f"{org_name}/{repo_name}" if org_name != 'Unknown' and org_name != 'Unknown Org' else repo_name
-        branch_ref = data.get('ref', '')
-        branch_name = branch_ref.split('/')[-1] if branch_ref else 'unknown'
-
-        if not commits and 'head_commit' in data:
-            commits = [data['head_commit']]
-            
-        for commit in commits:
-            # CALCULATE FILE STATS
-            added_list = commit.get('added', [])
-            removed_list = commit.get('removed', [])
-            modified_list = commit.get('modified', [])
-            
-            added_count = len(added_list)
-            removed_count = len(removed_list)
-            modified_count = len(modified_list)
-            
-            files_list = added_list + removed_list + modified_list
-            ai_response = generate_ai_analysis(commit, files_list)
-            
-            summary = ai_response.strip()
-            commit_id = commit.get('id', 'unknown')[:7]
-            all_updates.append(f"<b>Commit:</b> <code>{commit_id}</code>\n{summary}")
-            
-            # Save detailed stats to DB
-            save_to_db(target_chat_id, author_name, display_repo_name, branch_name, summary, added_count, modified_count, removed_count)
-                
-        if all_updates:
-            final_report = "\n\n----------------\n\n".join(all_updates)
-            send_to_telegram(final_report, author_name, display_repo_name, branch_name, target_bot_token, target_chat_id)
-            
-        print(f"✅ BACKGROUND TASK COMPLETE for {author_name}")
-    except Exception as e:
-        print(f"❌ CRITICAL TASK ERROR: {e}")
-        traceback.print_exc()
-
-# --- HELPER FUNCTIONS FOR DASHBOARD ---
-def get_date_boundaries():
-    """Get today, yesterday, and week start boundaries in UTC"""
-    now_ist = datetime.now(IST)
-    
-    # Start of today in IST
-    today_start_ist = IST.localize(datetime(now_ist.year, now_ist.month, now_ist.day, 0, 0, 0))
-    # Convert to UTC
-    today_start_utc = today_start_ist.astimezone(pytz.UTC)
-    
-    # Start of yesterday
-    yesterday_start_utc = today_start_utc - timedelta(days=1)
-    
-    # Start of week (Monday)
-    week_start_utc = today_start_utc - timedelta(days=now_ist.weekday())
-    
-    return today_start_utc, yesterday_start_utc, week_start_utc, now_ist
-
-def calculate_performance_score(today_data, week_data, now_ist):
-    """Calculate team performance score (0-100)"""
-    score = 0
-    
-    # 1. Today's activity (0-40 points)
-    today_changes = today_data['files_changed']
-    score += min(today_changes * 2, 40)
-    
-    # 2. Team participation (0-30 points)
-    active_devs = len(today_data['active_developers'])
-    total_devs = len(week_data)
-    if total_devs > 0:
-        participation = (active_devs / total_devs) * 30
-        score += participation
-    
-    # 3. Consistency check (Mon-Fri only)
-    weekday = now_ist.weekday()
-    if weekday < 5:  # Monday to Friday
-        if today_changes > 0:
-            score += 15  # Good work on a weekday
+        r = requests.get("https://api.github.com/user", headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}, timeout=8)
+        if r.status_code == 200:
+            return r.json()
         else:
-            score -= 10  # No activity on a weekday
-    
-    # 4. Multi-repo activity (0-10 points)
-    score += min(len(today_data.get('repos', set())) * 2, 10)
-    
-    # 5. Code quality bonus (based on commit diversity)
-    if today_data['files_added'] > today_data['files_removed']:
-        score += 5  # More additions than deletions is good
-    
-    return max(0, min(score, 100))
+            print("token validate failed:", r.status_code, r.text)
+            return None
+    except Exception as e:
+        print("validate_github_token error:", e)
+        return None
 
-def generate_motivation_message(today_data, yesterday_data, leaderboard, now_ist):
-    """Generate motivational message based on performance"""
-    weekday = now_ist.weekday()
-    today_changes = today_data['files_changed']
-    
-    # Weekend message
-    if weekday >= 5:
-        return {
-            'title': 'Weekend Mode',
-            'message': "🏖️ Perfect time for passion projects and exploration!"
-        }
-    
-    # Determine message based on performance
-    if today_changes >= 20:
-        level = 'high'
-    elif today_changes >= 10:
-        level = 'medium'
-    elif today_changes > 0:
-        level = 'low'
-    else:
-        level = 'none'
-    
-    messages = {
-        'high': [
-            "🚀 Incredible momentum! You're crushing it!",
-            "🔥 Unstoppable force! Keep up this amazing pace!",
-            "🌟 Stellar performance! The team is on fire!",
-            "💫 Breaking records! This is your best day yet!"
-        ],
-        'medium': [
-            "💪 Solid progress! Every commit counts!",
-            "📈 Good velocity! Consistency leads to success!",
-            "🎯 On target! Keep up the great work!",
-            "⚡ Making steady progress! Teamwork makes the dream work!"
-        ],
-        'low': [
-            "🔋 Good start! Ready for the next challenge?",
-            "💡 Every line of code matters! Keep building!",
-            "🏗️ Foundation laid! Time to build upwards!",
-            "🌱 Planting seeds for future growth!"
-        ],
-        'none': [
-            "🎪 The stage is set! What will you create today?",
-            "⚙️ Ready to build? The canvas is blank!",
-            "🚀 Launch sequence initiated! Time to code!",
-            "💡 New day, new opportunities!"
-        ]
-    }
-    
-    return {
-        'title': random.choice(['Daily Sprint', 'Team Momentum', 'Progress Pulse']),
-        'message': random.choice(messages[level])
-    }
+def try_compare_api_with_chat_token(owner, repo, before, after, chat_id):
+    token = get_decrypted_token_for_chat(chat_id)
+    if not token:
+        return None, "no-token"
+    url = f"https://api.github.com/repos/{owner}/{repo}/compare/{before}...{after}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    try:
+        r = requests.get(url, headers=headers, timeout=12)
+        if r.status_code == 200:
+            return r.json(), None
+        elif r.status_code in (401, 403):
+            return None, f"auth-failed-{r.status_code}"
+        else:
+            print("compare returned", r.status_code, r.text)
+            return None, f"error-{r.status_code}"
+    except Exception as e:
+        print("compare error:", e)
+        return None, "exception"
 
-# --- ROUTES ---
-@app.route('/', methods=['GET'])
-def home():
-    return "GitSync Bot Active"
+def mark_token_invalid(chat_id, reason=None):
+    creator = get_token_creator_for_chat(chat_id)
+    removed = remove_token_for_chat(chat_id)
+    group_msg = "⚠️ GitSync: The saved GitHub token for this group appears invalid or lacks required permissions. Exact per-file counts are now disabled until an admin reconfigures the token."
+    if reason:
+        group_msg += f"\n\nReason: {html.escape(reason)}"
+    try:
+        requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN_FOR_COMMANDS),
+                      json={"chat_id": chat_id, "text": group_msg, "parse_mode": "HTML"})
+    except Exception as e:
+        print("notify group failed:", e)
+    # notify creator by name in group (best-effort)
+    if creator:
+        try:
+            creator_msg = f"Hi {creator}, your saved GitHub token for this group appears invalid or revoked. Please reconfigure by clicking the secure setup link in the group (/gitsync)."
+            requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN_FOR_COMMANDS),
+                          json={"chat_id": chat_id, "text": creator_msg, "parse_mode": "HTML"})
+        except Exception as e:
+            print("notify creator failed:", e)
+    return removed
 
+# --- GitHub event handlers (store PRs/reviews/issues) ---
+def handle_pull_request_event(data, target_chat):
+    # insert/update pull_requests table
+    pr = data.get('pull_request', {})
+    pr_id = pr.get('id')
+    number = pr.get('number')
+    author = pr.get('user', {}).get('login')
+    repo = data.get('repository', {}).get('full_name')
+    state = pr.get('state')
+    created_at = pr.get('created_at')
+    merged_at = pr.get('merged_at')
+    closed_at = pr.get('closed_at')
+    additions = pr.get('additions', 0)
+    deletions = pr.get('deletions', 0)
+    changed_files = pr.get('changed_files', 0)
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO pull_requests (id, chat_id, repo_name, number, author, created_at, merged_at, closed_at, state, additions, deletions, changed_files)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (id) DO UPDATE
+              SET repo_name=EXCLUDED.repo_name, number=EXCLUDED.number, author=EXCLUDED.author,
+                  created_at=EXCLUDED.created_at, merged_at=EXCLUDED.merged_at, closed_at=EXCLUDED.closed_at,
+                  state=EXCLUDED.state, additions=EXCLUDED.additions, deletions=EXCLUDED.deletions, changed_files=EXCLUDED.changed_files
+        """, (pr_id, str(target_chat), repo, number, author, created_at, merged_at, closed_at, state, additions, deletions, changed_files))
+        conn.commit()
+    except Exception as e:
+        print("handle_pull_request error:", e)
+    finally:
+        conn.close()
+
+def handle_pr_review_event(data, target_chat):
+    review = data.get('review', {})
+    pr = data.get('pull_request', {})
+    pr_id = pr.get('id')
+    reviewer = review.get('user', {}).get('login')
+    state = review.get('state')
+    submitted_at = review.get('submitted_at')
+    review_id = review.get('id')
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO pr_reviews (id, pr_id, reviewer, state, submitted_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, submitted_at = EXCLUDED.submitted_at
+        """, (review_id, pr_id, reviewer, state, submitted_at))
+        conn.commit()
+    except Exception as e:
+        print("handle_pr_review error:", e)
+    finally:
+        conn.close()
+
+def handle_issues_event(data, target_chat):
+    issue = data.get('issue', {})
+    issue_id = issue.get('id')
+    repo = data.get('repository', {}).get('full_name')
+    number = issue.get('number')
+    author = issue.get('user', {}).get('login')
+    closed_by = issue.get('closed_by', {}).get('login') if issue.get('closed_by') else None
+    created_at = issue.get('created_at')
+    closed_at = issue.get('closed_at')
+    labels = [l.get('name') for l in issue.get('labels', [])]
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO issues_closed (id, repo_name, number, author, closed_by, created_at, closed_at, labels)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (id) DO UPDATE SET closed_by=EXCLUDED.closed_by, closed_at=EXCLUDED.closed_at
+        """, (issue_id, repo, number, author, closed_by, created_at, closed_at, labels))
+        conn.commit()
+    except Exception as e:
+        print("handle_issues_event error:", e)
+    finally:
+        conn.close()
+
+# --- WEBHOOK ROUTE (single endpoint handles multiple event types) ---
 @app.route('/webhook', methods=['POST'])
 def git_webhook():
     data = request.json
     secret_key = request.args.get('secret_key')
     target_chat_id = request.args.get('chat_id')
-
     validated_chat_id = get_chat_id_from_secret(secret_key)
-
     if not secret_key or not target_chat_id or str(validated_chat_id) != str(target_chat_id):
-        print(f"❌ Auth Failed. URL Chat: {target_chat_id} vs DB Chat: {validated_chat_id}")
+        print("Auth failed:", target_chat_id, validated_chat_id)
         return jsonify({"status": "error", "message": "Invalid secret_key or chat_id."}), 401
 
+    # Determine event type
+    gh_event = request.headers.get('X-GitHub-Event', '').lower()
+    # pick author nicely
     author_name = "Unknown"
     if 'pusher' in data:
-        author_name = data['pusher']['name']
+        author_name = data['pusher'].get('name')
     elif 'sender' in data:
-        author_name = data['sender']['login']
+        author_name = data['sender'].get('login')
 
-    executor.submit(process_standup_task, TELEGRAM_BOT_TOKEN_FOR_COMMANDS, target_chat_id, author_name, data)
-    
+    # route events
+    try:
+        if gh_event == 'pull_request':
+            handle_pull_request_event(data, target_chat_id)
+            # enqueue summary to group (optional)
+            pr = data.get('pull_request', {})
+            title = pr.get('title','')
+            number = pr.get('number')
+            action = data.get('action')
+            msg = f"🔀 Pull Request {action}: <b>#{number}</b> - {html.escape(title)}"
+            send_to_telegram(msg, "GitSync", data.get('repository',{}).get('full_name',''), pr.get('head',{}).get('ref',''), TELEGRAM_BOT_TOKEN_FOR_COMMANDS, target_chat_id)
+        elif gh_event == 'pull_request_review':
+            handle_pr_review_event(data, target_chat_id)
+            pr = data.get('pull_request', {})
+            reviewer = data.get('review', {}).get('user',{}).get('login')
+            state = data.get('review', {}).get('state')
+            msg = f"🧐 PR Review by <b>{html.escape(reviewer or 'unknown')}</b>: <b>#{pr.get('number')}</b> — {state}"
+            send_to_telegram(msg, "GitSync", data.get('repository',{}).get('full_name',''), pr.get('head',{}).get('ref',''), TELEGRAM_BOT_TOKEN_FOR_COMMANDS, target_chat_id)
+        elif gh_event == 'issues':
+            handle_issues_event(data, target_chat_id)
+            issue = data.get('issue', {})
+            action = data.get('action')
+            msg = f"📌 Issue {action}: <b>#{issue.get('number')}</b> — {html.escape(issue.get('title',''))}"
+            send_to_telegram(msg, "GitSync", data.get('repository',{}).get('full_name',''), '', TELEGRAM_BOT_TOKEN_FOR_COMMANDS, target_chat_id)
+        else:
+            # default: treat as push
+            executor.submit(process_standup_task, TELEGRAM_BOT_TOKEN_FOR_COMMANDS, target_chat_id, author_name, data)
+    except Exception as e:
+        print("webhook dispatch error:", e)
+        traceback.print_exc()
+
     return jsonify({"status": "processing", "message": "Accepted"}), 200
 
+# --- STANDUP / PROCESSING (push handling) ---
+def process_standup_task(target_bot_token, target_chat_id, author_name, data):
+    try:
+        all_updates = []
+        commits = data.get('commits', [])
+        repo_name = data.get('repository', {}).get('name', 'Unknown Repo')
+        org_name = data.get('repository', {}).get('organization', 'Unknown Org')
+        if isinstance(org_name, dict): org_name = org_name.get('login', 'Unknown')
+        display_repo_name = f"{org_name}/{repo_name}" if org_name not in ('Unknown','Unknown Org') else repo_name
+        branch_ref = data.get('ref', '')
+        branch_name = branch_ref.split('/')[-1] if branch_ref else 'unknown'
+        if not commits and 'head_commit' in data:
+            commits = [data['head_commit']]
+
+        owner = data.get('repository', {}).get('owner', {}) or {}
+        owner_login = owner.get('login') or owner.get('name')
+        before_sha = data.get('before')
+        after_sha = data.get('after')
+
+        compare_data = None
+        compare_err = None
+        if owner_login and repo_name and before_sha and after_sha:
+            compare_data, compare_err = try_compare_api_with_chat_token(owner_login, repo_name, before_sha, after_sha, target_chat_id)
+
+        if compare_data:
+            files_info = compare_data.get('files', [])
+            file_map = {f['filename']:(f.get('additions',0), f.get('deletions',0), f.get('status','modified')) for f in files_info}
+            total_added = sum(v[0] for v in file_map.values())
+            total_removed = sum(v[1] for v in file_map.values())
+            total_modified = sum(1 for v in file_map.values() if v[2]=='modified')
+            files_list = list(file_map.keys())
+            head_commit = data.get('head_commit') or (commits[0] if commits else {})
+            ai_response = generate_ai_analysis(head_commit or {}, files_list)
+            summary = ai_response.strip()
+            # Save summary + exact lines
+            save_to_db(target_chat_id, author_name, display_repo_name, branch_name, summary, 0, total_modified, 0, lines_added=total_added, lines_removed=total_removed)
+            lines_text = "\n".join([f"{k}: +{v[0]} / -{v[1]}" for k,v in file_map.items()])
+            final_summary = f"<b>Push Summary (exact)</b>\n{summary}\n\n{lines_text}\n\n<b>Confidence:</b> exact"
+            send_to_telegram(final_summary, author_name, display_repo_name, branch_name, target_bot_token, target_chat_id)
+        else:
+            confidence_tag = "estimated"
+            if compare_err and compare_err.startswith("auth-failed"):
+                try:
+                    mark_token_invalid(target_chat_id, reason=compare_err)
+                except Exception as e:
+                    print("mark_token_invalid failed:", e)
+                confidence_tag = "token-invalid"
+            if not commits and 'head_commit' in data:
+                commits = [data['head_commit']]
+            for commit in commits:
+                added_list = commit.get('added', [])
+                removed_list = commit.get('removed', [])
+                modified_list = commit.get('modified', [])
+                added_count = len(added_list)
+                removed_count = len(removed_list)
+                modified_count = len(modified_list)
+                files_list = added_list + removed_list + modified_list
+                ai_response = generate_ai_analysis(commit, files_list)
+                summary = ai_response.strip()
+                commit_id = commit.get('id', 'unknown')[:7]
+                all_updates.append(f"<b>Commit:</b> <code>{commit_id}</code>\n{summary}\n\n<b>Confidence:</b> {confidence_tag}")
+                save_to_db(target_chat_id, author_name, display_repo_name, branch_name, summary, added_count, modified_count, removed_count)
+            if all_updates:
+                final_report = "\n\n----------------\n\n".join(all_updates)
+                send_to_telegram(final_report, author_name, display_repo_name, branch_name, target_bot_token, target_chat_id)
+        print("Background task complete.")
+    except Exception as e:
+        print("process_standup_task error:", e)
+        traceback.print_exc()
+
+# --- TELEGRAM COMMANDS endpoint (handles /start, /gitsync, /dashboard, token paste) ---
 @app.route('/telegram_commands', methods=['POST'])
 def telegram_commands():
     update = request.json
-
     BOT_TOKEN = TELEGRAM_BOT_TOKEN_FOR_COMMANDS
     APP_BASE_URL_USED = APP_BASE_URL
 
@@ -414,359 +686,407 @@ def telegram_commands():
         message = update['message']
         message_text = message.get('text', '')
         chat_id = message['chat']['id']
-        
-        if message_text.startswith('/start'):
-            guide_text = (
-                "👋 <b>Welcome to GitSync!</b>\n\n"
-                "Add me to your Telegram organization group to instantly generate a unique webhook for your team.\n\n"
-                "I'll handle everything automatically — just drop me in, and your dashboard comes alive.\n\n"
-                "Tap →Add(User_Name:<code>@QubreaSyncBot</code>)→ Done.\n\n"
-                "Let's get your team synced in seconds.\n\n"
-                "Once added, run:\n"
-                "🔹 <code>/gitsync</code> to get your webhook URL\n"
-                "🔹 <code>/dashboard</code> to see your team's analytics"
-            )
-            requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), 
-                          json={"chat_id": chat_id, "text": guide_text, "parse_mode": "HTML"})
 
-        elif message_text.startswith('/gitsync'):
+        # /start (supports deep-link payload)
+        if message_text.startswith('/start'):
+            parts = message_text.strip().split()
+            if len(parts) > 1:
+                secret_payload = parts[1].strip()
+                target_chat = get_chat_id_from_secret(secret_payload)
+                if not target_chat:
+                    requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), json={"chat_id": chat_id, "text": "❌ This setup link is invalid or expired.", "parse_mode":"HTML"})
+                else:
+                    create_pending_request(secret_payload, message['from']['id'], target_chat)
+                    requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), json={"chat_id": chat_id, "text": "🔒 Paste your GitHub PAT in this private chat. It will be stored encrypted and never shown. (Expires in 15 minutes)", "parse_mode":"HTML"})
+            else:
+                guide_text = (
+                    "👋 <b>Welcome to GitSync!</b>\n\n"
+                    "Add me to your Telegram organization group to instantly generate a unique webhook for your team.\n\n"
+                    f"Tap →Add(User_Name:<code>@{BOT_USERNAME}</code>)→ Done.\n\n"
+                    "Run:\n🔹 <code>/gitsync</code>\n🔹 <code>/dashboard</code>"
+                )
+                requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), json={"chat_id": chat_id, "text": guide_text, "parse_mode":"HTML"})
+            return jsonify({"status":"ok"}), 200
+
+        if message_text.startswith('/gitsync'):
             new_key = str(uuid.uuid4())
             save_webhook_config(chat_id, new_key)
             webhook_url = f"{APP_BASE_URL_USED}/webhook?secret_key={new_key}&chat_id={chat_id}"
-            
+            deep_link = f"https://t.me/{BOT_USERNAME}?start={new_key}"
             response_text = (
                 "👋 <b>GitSync Setup Guide</b>\n\n"
-                "1. Copy your unique Webhook URL (The token is hidden!):\n\n"
+                "1. Copy your unique Webhook URL:\n\n"
                 f"<code>{webhook_url}</code>\n\n"
-                "2. Paste this URL into your GitHub repository settings under Webhooks.\n"
-                "(Content Type: <code>application/json</code>, Events: <code>Just the push event</code>.)\n\n"
-                "Once added, run:\n"
-                "🔹 <code>/dashboard</code> to see your team's analytics\n\n"
-                "I will now start analyzing your commits!"
+                "2. Paste in GitHub repo settings → Webhooks (push event).\n\n"
+                f"3. To enable exact line counts for private repos, an admin should click: <a href=\"{deep_link}\">secure token setup (private DM)</a>\n\n"
+                "Then run /dashboard."
             )
-            requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), 
-                          json={"chat_id": chat_id, "text": response_text, "parse_mode": "HTML"})
-            
-        elif message_text.startswith('/dashboard'):
+            requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), json={"chat_id": chat_id, "text": response_text, "parse_mode":"HTML", "disable_web_page_preview": True})
+            return jsonify({"status":"ok"}), 200
+
+        if message_text.startswith('/dashboard'):
             key = get_secret_from_chat_id(chat_id)
             if key:
                 dashboard_url = f"{APP_BASE_URL}/dashboard?key={key}"
-                response_text = f"📊 <b>Team Dashboard</b>\n\nYour team's performance graph is waiting!\nOpen the dashboard and See what your team shipped today \n<a href='{dashboard_url}'>Open Dashboard</a>"
+                response_text = f"📊 <b>Team Dashboard</b>\nOpen: <a href='{dashboard_url}'>Open Dashboard</a>"
             else:
-                response_text = "❌ <b>Error:</b> Please run <code>/gitsync</code> first to set up your group."
+                response_text = "❌ Run /gitsync first."
+            requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), json={"chat_id": chat_id, "text": response_text, "parse_mode":"HTML"})
+            return jsonify({"status":"ok"}), 200
 
-            requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), 
-                          json={"chat_id": chat_id, "text": response_text, "parse_mode": "HTML"})
+        # private chat flows: token paste & removal
+        def looks_like_token(s):
+            return bool(re.search(r'ghp_|gho_|github_pat_|ghs_|ghu_|ghr_', s)) or len(s.strip()) > 30
 
-    return jsonify({"status": "ok"}), 200
+        if message['chat']['type'] == 'private':
+            text = message_text.strip()
+            if text.startswith('/remove_github_token'):
+                pending = get_pending_request_by_user(message['from']['id'])
+                if pending:
+                    target_chat = pending['chat_id']
+                    ok = remove_token_for_chat(target_chat)
+                    clear_pending_request_by_user(message['from']['id'])
+                    if ok:
+                        requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), json={"chat_id": chat_id, "text": "✅ Token removed.", "parse_mode":"HTML"})
+                        requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), json={"chat_id": target_chat, "text": "⚠️ GitSync: Token removed. Exact counts disabled.", "parse_mode":"HTML"})
+                    else:
+                        requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), json={"chat_id": chat_id, "text": "❌ Remove failed.", "parse_mode":"HTML"})
+                else:
+                    requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), json={"chat_id": chat_id, "text": "⚠️ Click group setup link first.", "parse_mode":"HTML"})
+                return jsonify({"status":"ok"}), 200
 
-# --- 📊 FIXED DASHBOARD ROUTE ---
+            if looks_like_token(text):
+                pending = get_pending_request_by_user(message['from']['id'])
+                if not pending:
+                    requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), json={"chat_id": chat_id, "text": "⚠️ No pending request found. Use group's setup link.", "parse_mode":"HTML"})
+                else:
+                    target_chat_id = pending['chat_id']
+                    v = validate_github_token(text)
+                    if v:
+                        saved = save_encrypted_token_for_chat(target_chat_id, text, created_by=message.get('from',{}).get('username'))
+                        clear_pending_request_by_user(message['from']['id'])
+                        if saved:
+                            group_msg = f"✅ GitHub token installed by <b>{html.escape(message.get('from',{}).get('username','admin'))}</b>. Exact per-file insertions/deletions enabled."
+                            requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), json={"chat_id": target_chat_id, "text": group_msg, "parse_mode":"HTML"})
+                            requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), json={"chat_id": chat_id, "text": "✅ Token validated and saved securely.", "parse_mode":"HTML"})
+                        else:
+                            requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), json={"chat_id": chat_id, "text": "❌ Save failed.", "parse_mode":"HTML"})
+                    else:
+                        requests.post(TELEGRAM_API_URL.format(token=BOT_TOKEN), json={"chat_id": chat_id, "text": "❌ Token validation failed. Ensure 'repo' permissions are present.", "parse_mode":"HTML"})
+                return jsonify({"status":"ok"}), 200
+
+    return jsonify({"status":"ok"}), 200
+
+# --- Dashboard route (final metrics & corporate leaderboard) ---
 @app.route('/dashboard', methods=['GET'])
 def dashboard():
     secret_key = request.args.get('key')
     if not secret_key:
         return "<h1>401 Unauthorized</h1><p>Access denied.</p>", 401
-    
+
     target_chat_id = get_chat_id_from_secret(secret_key)
     if not target_chat_id:
         return "<h1>401 Unauthorized</h1><p>Invalid dashboard key.</p>", 401
-    
+
     conn = get_db_connection()
-    if not conn: 
-        return """
-        <html>
-        <head><title>Database Error</title></head>
-        <body style="font-family: Arial, sans-serif; padding: 20px;">
-            <h1>⚠️ Database Connection Error</h1>
-            <p>Unable to connect to the database. Please try again later.</p>
-        </body>
-        </html>
-        """, 500
-    
+    if not conn:
+        return "<h1>Database Error</h1><p>Unable to connect.</p>", 500
     try:
         c = conn.cursor()
-        
-        # Get date boundaries
+        # date boundaries
         today_start_utc, yesterday_start_utc, week_start_utc, now_ist = get_date_boundaries()
-        
-        # 1. Get organization name
-        c.execute("""
-            SELECT repo_name FROM project_updates 
-            WHERE chat_id = %s 
-            ORDER BY timestamp DESC LIMIT 1
-        """, (str(target_chat_id),))
-        repo_result = c.fetchone()
-        org_title = repo_result[0] if repo_result and repo_result[0] else "Development Team"
-        
-        # 2. Get all developers in this group
-        c.execute("""
-            SELECT DISTINCT author FROM project_updates 
-            WHERE chat_id = %s 
-            ORDER BY author
-        """, (str(target_chat_id),))
+        # org title
+        c.execute("SELECT repo_name FROM project_updates WHERE chat_id = %s ORDER BY timestamp DESC LIMIT 1", (str(target_chat_id),))
+        r = c.fetchone()
+        org_title = r[0] if r and r[0] else "Development Team"
+
+        # fetch distinct developers
+        c.execute("SELECT DISTINCT author FROM project_updates WHERE chat_id = %s ORDER BY author", (str(target_chat_id),))
         developers = [row[0] for row in c.fetchall()]
         total_developers = len(developers)
-        
-        # 3. Fetch all commits for this group
+
+        # -----------------------------
+        # Practical, data-driven metrics
+        # -----------------------------
+        # 1) Today's stats (exact lines)
         c.execute("""
-            SELECT author, files_added, files_modified, files_removed, 
-                   timestamp, repo_name, summary
-            FROM project_updates 
-            WHERE chat_id = %s 
-            ORDER BY timestamp DESC
-        """, (str(target_chat_id),))
-        all_commits = c.fetchall()
-        
-        # Initialize data structures
-        daily_stats = {i: {'added': 0, 'modified': 0, 'removed': 0, 'commits': 0} 
-                      for i in range(7)}
-        
-        today_data = {
-            'total_commits': 0,
-            'files_added': 0,
-            'files_modified': 0,
-            'files_removed': 0,
-            'files_changed': 0,
-            'active_developers': set(),
-            'repos': set()
-        }
-        
-        yesterday_data = {
-            'files_changed': 0,
-            'developers': set()
-        }
-        
-        week_data = {dev: {
-            'commits': 0,
-            'added': 0,
-            'modified': 0,
-            'removed': 0,
-            'score': 0,
-            'activity_days': set()
-        } for dev in developers}
-        
-        recent_activities = []
-        
-        # Process all commits
-        for commit in all_commits:
-            author = commit[0]
-            added = commit[1] or 0
-            modified = commit[2] or 0
-            removed = commit[3] or 0
-            timestamp = commit[4]  # This is timezone-aware UTC from PostgreSQL
-            repo = commit[5]
-            summary = commit[6]
-            
-            # Ensure timestamp is timezone-aware
-            if timestamp.tzinfo is None:
-                timestamp = pytz.utc.localize(timestamp)
-            
-            # Convert to IST for display
-            commit_time_ist = timestamp.astimezone(IST)
-            commit_date_ist = commit_time_ist.date()
-            days_ago = (now_ist.date() - commit_date_ist).days
-            
-            # Calculate score (weighted: added > modified > removed)
-            score = (added * 3) + (modified * 2) + (removed * 1)
-            
-            # Today's commits (compare in UTC)
-            if timestamp >= today_start_utc:
-                today_data['total_commits'] += 1
-                today_data['files_added'] += added
-                today_data['files_modified'] += modified
-                today_data['files_removed'] += removed
-                today_data['files_changed'] += (added + modified + removed)
-                today_data['active_developers'].add(author)
-                today_data['repos'].add(repo)
-                
-                # Add to recent activities
-                if len(recent_activities) < 5:
-                    activity_types = [
-                        {'icon': 'fas fa-plus-circle', 'color': '#2ecc71', 'title': 'Files Added'},
-                        {'icon': 'fas fa-edit', 'color': '#f1c40f', 'title': 'Files Modified'},
-                        {'icon': 'fas fa-minus-circle', 'color': '#e74c3c', 'title': 'Files Removed'},
-                        {'icon': 'fas fa-code', 'color': '#3498db', 'title': 'Code Commit'},
-                        {'icon': 'fas fa-bug', 'color': '#9b59b6', 'title': 'Bug Fix'}
-                    ]
-                    activity = random.choice(activity_types)
-                    
-                    recent_activities.append({
-                        'title': f"{author} committed",
-                        'description': f"{added} added, {modified} modified in {repo}" if added or modified else f"Cleaned up {removed} files",
-                        'icon': activity['icon'],
-                        'color': activity['color'],
-                        'time': commit_time_ist.strftime('%I:%M %p')
-                    })
-            
-            # Yesterday's commits
-            elif yesterday_start_utc <= timestamp < today_start_utc:
-                yesterday_data['files_changed'] += (added + modified + removed)
-                yesterday_data['developers'].add(author)
-            
-            # This week's commits (for leaderboard)
-            if timestamp >= week_start_utc:
-                week_data[author]['commits'] += 1
-                week_data[author]['added'] += added
-                week_data[author]['modified'] += modified
-                week_data[author]['removed'] += removed
-                week_data[author]['score'] += score
-                week_data[author]['activity_days'].add(commit_date_ist.weekday())
-            
-            # Last 7 days for chart
-            if 0 <= days_ago < 7:
-                idx = 6 - days_ago
-                daily_stats[idx]['added'] += added
-                daily_stats[idx]['modified'] += modified
-                daily_stats[idx]['removed'] += removed
-                daily_stats[idx]['commits'] += 1
-        
-        # Calculate statistics
-        active_developers = len(today_data['active_developers'])
-        
-        # Calculate changes from yesterday
-        yesterday_changes = yesterday_data['files_changed']
-        today_changes = today_data['files_changed']
-        
-        if yesterday_changes > 0:
-            change_percent = ((today_changes - yesterday_changes) / yesterday_changes) * 100
-        else:
-            change_percent = 100 if today_changes > 0 else 0
-        
-        # Calculate performance score
-        performance_score = calculate_performance_score(today_data, week_data, now_ist)
-        
-        # Create leaderboard
-        leaderboard = []
-        for dev, stats in week_data.items():
-            if stats['score'] > 0:
-                # Calculate consistency bonus (extra points for working multiple days)
-                consistency_bonus = len(stats['activity_days']) * 5
-                
-                leaderboard.append({
-                    'name': dev,
-                    'commits': stats['commits'],
-                    'files_changed': stats['added'] + stats['modified'] + stats['removed'],
-                    'score': stats['score'] + consistency_bonus,
-                    'consistency': len(stats['activity_days'])
-                })
-        
-        # Sort leaderboard
-        leaderboard.sort(key=lambda x: x['score'], reverse=True)
-        leaderboard = leaderboard[:10]
-        
-        # Calculate progress percentages
-        target_per_day = 10  # Target files changed per day
-        today_progress = min(round((today_changes / target_per_day) * 100), 100) if target_per_day > 0 else 0
-        
-        # Weekly progress (target for 5 working days)
-        week_files = sum(daily_stats[i]['added'] + daily_stats[i]['modified'] + daily_stats[i]['removed'] 
-                        for i in range(7))
-        target_per_week = target_per_day * 5
-        week_progress = min(round((week_files / target_per_week) * 100), 100) if target_per_week > 0 else 0
-        
-        # Sprint progress (simulated based on weekly performance)
-        sprint_progress = min(week_progress + random.randint(10, 30), 100)
-        
-        # Generate motivation message
-        motivation = generate_motivation_message(today_data, yesterday_data, leaderboard, now_ist)
-        
-        # Top performer message
-        top_performer = leaderboard[0] if leaderboard else None
-        top_performer_message = f"{top_performer['name']} is leading with {int(top_performer['score'])} points!" if top_performer else "No activity yet this week!"
-        
-        # Prepare chart data
-        chart_labels = []
+            SELECT
+              COALESCE(SUM(lines_added),0) as lines_added,
+              COALESCE(SUM(lines_removed),0) as lines_removed,
+              COUNT(*) as commits_count,
+              COUNT(DISTINCT author) as active_devs
+            FROM project_updates
+            WHERE chat_id = %s AND timestamp >= %s
+        """, (str(target_chat_id), today_start_utc))
+        today_row = c.fetchone()
+        today_lines_added = int(today_row[0] or 0)
+        today_lines_removed = int(today_row[1] or 0)
+        today_commits = int(today_row[2] or 0)
+        today_active_devs = int(today_row[3] or 0)
+        today_net_lines = today_lines_added - today_lines_removed
+
+        # 2) Week-to-date totals
+        c.execute("""
+            SELECT
+              COALESCE(SUM(lines_added),0) as lines_added,
+              COALESCE(SUM(lines_removed),0) as lines_removed,
+              COUNT(*) as commits_count
+            FROM project_updates
+            WHERE chat_id = %s AND timestamp >= %s
+        """, (str(target_chat_id), week_start_utc))
+        week_row = c.fetchone()
+        week_lines_added = int(week_row[0] or 0)
+        week_lines_removed = int(week_row[1] or 0)
+        week_commits = int(week_row[2] or 0)
+        week_lines_changed = week_lines_added + week_lines_removed
+        week_net_lines = week_lines_added - week_lines_removed
+
+        # 3) Last 7 days daily breakdown
+        daily_lines_added = []
+        daily_lines_removed = []
+        labels = []
         for i in range(6, -1, -1):
-            date = now_ist - timedelta(days=i)
-            chart_labels.append(date.strftime('%a'))
-        
-        # Prepare template data
+            date_ist = now_ist - timedelta(days=i)
+            labels.append(date_ist.strftime('%a'))
+            day_start_utc = datetime(date_ist.year, date_ist.month, date_ist.day, 0,0,0, tzinfo=IST).astimezone(pytz.UTC)
+            day_end_utc = day_start_utc + timedelta(days=1)
+            c.execute("""
+                SELECT COALESCE(SUM(lines_added),0), COALESCE(SUM(lines_removed),0)
+                FROM project_updates
+                WHERE chat_id = %s AND timestamp >= %s AND timestamp < %s
+            """, (str(target_chat_id), day_start_utc, day_end_utc))
+            rr = c.fetchone()
+            daily_lines_added.append(int(rr[0] or 0))
+            daily_lines_removed.append(int(rr[1] or 0))
+
+        # 4) churn ratio
+        churn_ratio = (week_lines_removed / (week_lines_added + week_lines_removed)) if (week_lines_added + week_lines_removed) > 0 else 0.0
+
+        # 5) velocity
+        velocity_today_per_dev = (today_net_lines / max(1, today_active_devs)) if today_active_devs > 0 else 0
+        velocity_week_per_dev = (week_net_lines / max(1, len(developers))) if len(developers) > 0 else 0
+
+        # 6) Corporate leaderboard (composite using PRs, reviews, issues, speed, CI, cross-team)
+        period_start = week_start_utc
+
+        # merged PRs
+        c.execute("""SELECT author, COUNT(*) AS merged_prs
+                     FROM pull_requests
+                     WHERE merged_at IS NOT NULL AND merged_at >= %s
+                     GROUP BY author""", (period_start,))
+        merged_rows = {r[0]: int(r[1]) for r in c.fetchall()}
+
+        # reviews
+        c.execute("""SELECT reviewer AS author, COUNT(*) AS reviews_done,
+                            SUM(CASE WHEN state='APPROVED' THEN 1 ELSE 0 END) AS approvals
+                     FROM pr_reviews r
+                     JOIN pull_requests p ON r.pr_id = p.id
+                     WHERE r.submitted_at >= %s
+                     GROUP BY reviewer""", (period_start,))
+        review_rows = {r[0]: {'reviews_done': int(r[1]), 'approvals': int(r[2])} for r in c.fetchall()}
+
+        # issues closed
+        c.execute("""SELECT closed_by AS author, COUNT(*) AS issues_closed,
+                            SUM(CASE WHEN labels && ARRAY['bug'] THEN 1 ELSE 0 END) AS bugs_closed
+                     FROM issues_closed
+                     WHERE closed_at >= %s
+                     GROUP BY closed_by""", (period_start,))
+        issue_rows = {r[0]: {'issues_closed': int(r[1]), 'bugs_closed': int(r[2] or 0)} for r in c.fetchall()}
+
+        # first review time per author (lower better)
+        c.execute("""WITH first_review AS (
+                       SELECT pr_id, MIN(submitted_at) AS first_review_at
+                       FROM pr_reviews GROUP BY pr_id
+                     )
+                     SELECT p.author, AVG(EXTRACT(epoch FROM (fr.first_review_at - p.created_at))) AS avg_first_review_secs
+                     FROM pull_requests p JOIN first_review fr ON fr.pr_id = p.id
+                     WHERE p.created_at >= %s
+                     GROUP BY p.author""", (period_start,))
+        first_review_rows = {r[0]: float(r[1]) for r in c.fetchall()}
+
+        # avg merge secs
+        c.execute("""SELECT author, AVG(EXTRACT(epoch FROM (merged_at - created_at))) AS avg_merge_secs
+                     FROM pull_requests
+                     WHERE merged_at IS NOT NULL AND created_at >= %s
+                     GROUP BY author""", (period_start,))
+        merge_time_rows = {r[0]: float(r[1]) for r in c.fetchall()}
+
+        # ci pass rates
+        c.execute("""SELECT p.author,
+                            SUM(CASE WHEN c.status='success' THEN 1 ELSE 0 END) AS passed,
+                            COUNT(c.*) AS total
+                     FROM pull_requests p
+                     LEFT JOIN ci_results c ON c.pr_id = p.id
+                     WHERE p.created_at >= %s
+                     GROUP BY p.author""", (period_start,))
+        ci_rows = {r[0]: {'passed': int(r[1] or 0), 'total': int(r[2] or 0)} for r in c.fetchall()}
+
+        # cross-team reviews (reviewer != pr author)
+        c.execute("""SELECT r.reviewer AS author, COUNT(*) AS cross_reviews
+                     FROM pr_reviews r
+                     JOIN pull_requests p ON r.pr_id = p.id
+                     WHERE r.submitted_at >= %s AND r.reviewer <> p.author
+                     GROUP BY r.reviewer""", (period_start,))
+        cross_rows = {r[0]: int(r[1]) for r in c.fetchall()}
+
+        authors = set(merged_rows) | set(review_rows) | set(issue_rows) | set(first_review_rows) | set(merge_time_rows) | set(ci_rows) | set(cross_rows)
+
+        metrics = {}
+        for a in authors:
+            metrics[a] = {
+                'merged_prs': merged_rows.get(a, 0),
+                'reviews_done': review_rows.get(a, {}).get('reviews_done', 0),
+                'approvals': review_rows.get(a, {}).get('approvals', 0),
+                'issues_closed': issue_rows.get(a, {}).get('issues_closed', 0),
+                'bugs_closed': issue_rows.get(a, {}).get('bugs_closed', 0),
+                'avg_first_review_secs': first_review_rows.get(a, None),
+                'avg_merge_secs': merge_time_rows.get(a, None),
+                'ci_pass_rate': (ci_rows.get(a, {}).get('passed',0) / max(1, ci_rows.get(a, {}).get('total',0))) if ci_rows.get(a) else None,
+                'cross_reviews': cross_rows.get(a, 0)
+            }
+
+        def normalize_map(vals):
+            if not vals:
+                return {}
+            maxv = max(vals.values())
+            if maxv == 0:
+                return {k: 0.0 for k in vals}
+            return {k: (v / maxv) for k,v in vals.items()}
+
+        merged_map = {a: metrics[a]['merged_prs'] for a in authors}
+        reviews_map = {a: metrics[a]['reviews_done'] for a in authors}
+        issues_map = {a: metrics[a]['issues_closed'] for a in authors}
+        cross_map = {a: metrics[a]['cross_reviews'] for a in authors}
+        first_review_map = {a: (metrics[a]['avg_first_review_secs'] if metrics[a]['avg_first_review_secs'] else None) for a in authors}
+        merge_time_map = {a: (metrics[a]['avg_merge_secs'] if metrics[a]['avg_merge_secs'] else None) for a in authors}
+        ci_map = {a: (metrics[a]['ci_pass_rate'] if metrics[a]['ci_pass_rate'] is not None else 0.0) for a in authors}
+
+        n_merged = normalize_map(merged_map)
+        n_reviews = normalize_map(reviews_map)
+        n_issues = normalize_map(issues_map)
+        n_cross = normalize_map(cross_map)
+        n_ci = normalize_map(ci_map)
+
+        def normalize_time_map(time_map):
+            filtered = {k:v for k,v in time_map.items() if v is not None}
+            if not filtered:
+                return {k:0.0 for k in time_map}
+            maxv = max(filtered.values())
+            if maxv == 0:
+                return {k:1.0 for k in filtered}
+            scores = {}
+            for k in time_map:
+                v = time_map[k]
+                if v is None:
+                    scores[k] = 0.0
+                else:
+                    scores[k] = 1.0 - (v / maxv)
+            return scores
+
+        n_first_review = normalize_time_map(first_review_map)
+        n_merge_time = normalize_time_map(merge_time_map)
+
+        weights = {
+            'merged_prs': 0.30,
+            'reviews': 0.20,
+            'issues': 0.12,
+            'first_review_speed': 0.10,
+            'merge_speed': 0.08,
+            'ci': 0.10,
+            'cross_reviews': 0.05
+        }
+
+        leaderboard = []
+        for a in sorted(authors):
+            score = 0.0
+            score += weights['merged_prs'] * n_merged.get(a, 0.0)
+            score += weights['reviews'] * n_reviews.get(a, 0.0)
+            score += weights['issues'] * n_issues.get(a, 0.0)
+            score += weights['first_review_speed'] * n_first_review.get(a, 0.0)
+            score += weights['merge_speed'] * n_merge_time.get(a, 0.0)
+            score += weights['ci'] * n_ci.get(a, 0.0)
+            score += weights['cross_reviews'] * n_cross.get(a, 0.0)
+
+            leaderboard.append({
+                'name': a,
+                'score': round(score * 100, 2),
+                'merged_prs': metrics[a]['merged_prs'],
+                'reviews_done': metrics[a]['reviews_done'],
+                'issues_closed': metrics[a]['issues_closed'],
+                'ci_pass_rate': metrics[a].get('ci_pass_rate', None)
+            })
+
+        leaderboard.sort(key=lambda x: x['score'], reverse=True)
+
+        # -- prepare template data
         template_data = {
             'org_title': org_title,
             'total_members': total_developers,
             'current_date': now_ist.strftime('%B %d, %Y'),
             'week_number': now_ist.isocalendar()[1],
             'today_stats': {
-                'total_commits': today_data['total_commits'],
-                'files_changed': today_changes,
-                'active_developers': active_developers,
-                'change_percentage': round(change_percent, 1),
-                'active_percentage': round((active_developers / max(total_developers, 1)) * 100),
-                'velocity_score': round(performance_score, 1),
-                'velocity_change': 5 if today_changes > yesterday_changes else -5,
-                'repos': len(today_data['repos'])
+                'lines_added': today_lines_added,
+                'lines_removed': today_lines_removed,
+                'net_lines': today_net_lines,
+                'commits': today_commits,
+                'active_developers': today_active_devs,
+                'velocity_per_dev': round(velocity_today_per_dev,1),
+                'confidence_exact': (today_lines_added+today_lines_removed+week_lines_changed)>0
             },
             'daily_stats': {
-                'labels': chart_labels,
-                'added': [daily_stats[i]['added'] for i in range(7)],
-                'modified': [daily_stats[i]['modified'] for i in range(7)],
-                'removed': [daily_stats[i]['removed'] for i in range(7)],
-                'commits': [daily_stats[i]['commits'] for i in range(7)]
+                'labels': labels,
+                'added': daily_lines_added,
+                'removed': daily_lines_removed,
+                'net': [daily_lines_added[i]-daily_lines_removed[i] for i in range(7)]
             },
             'leaderboard': leaderboard,
-            'today_progress': today_progress,
-            'week_progress': week_progress,
-            'sprint_progress': sprint_progress,
-            'recent_activities': recent_activities,
-            'motivation_title': motivation['title'],
-            'motivation_message': motivation['message'],
-            'top_performer_message': top_performer_message
+            'week_progress': {
+                'lines_added': week_lines_added,
+                'lines_removed': week_lines_removed,
+                'net_lines': week_net_lines,
+                'commits': week_commits,
+                'lines_changed': week_lines_changed,
+                'churn_ratio': round(churn_ratio,3)
+            }
         }
-        
+
         conn.close()
-        
-        # Render template
-        from flask import render_template_string
+
+        # Render the dashboard template from file if present
         try:
             with open('templates/dashboard.html', 'r', encoding='utf-8') as f:
                 template = f.read()
             return render_template_string(template, **template_data)
         except FileNotFoundError:
-            # Fallback template if dashboard.html is missing
-            return """
-            <html>
-            <head><title>Dashboard - {}</title></head>
-            <body style="font-family: Arial, sans-serif; padding: 20px;">
-                <h1>📊 {} Dashboard</h1>
-                <p>Today's Progress: {}%</p>
-                <p>Active Developers: {}/{} ({:.1f}%)</p>
-                <p>Performance Score: {:.1f}/100</p>
-                <hr>
-                <p>Full dashboard template is being loaded...</p>
-            </body>
-            </html>
-            """.format(
-                org_title, org_title, today_progress,
-                active_developers, total_developers,
-                round((active_developers / max(total_developers, 1)) * 100, 1),
-                performance_score
-            )
-        
+            # minimal fallback
+            return f"""
+            <html><body style="font-family: Arial;">
+            <h1>Dashboard - {html.escape(org_title)}</h1>
+            <p>Today lines added: {template_data['today_stats']['lines_added']}</p>
+            <p>Today lines removed: {template_data['today_stats']['lines_removed']}</p>
+            <p>Leaderboard: {', '.join([x['name']+':'+str(x['score']) for x in leaderboard[:5]])}</p>
+            </body></html>
+            """, 200
+
     except Exception as e:
-        print(f"❌ Dashboard Error: {e}")
+        print("dashboard error:", e)
         traceback.print_exc()
         conn.close()
-        return """
-        <html>
-        <head><title>Dashboard Error</title></head>
-        <body style="font-family: Arial, sans-serif; padding: 20px;">
-            <h1>⚠️ Dashboard Error</h1>
-            <p>Error: {}</p>
-            <p>Please try again or contact support if the issue persists.</p>
-        </body>
-        </html>
-        """.format(str(e)), 500
+        return "<h1>Dashboard Error</h1><p>See server logs.</p>", 500
 
-# Add health check endpoint
+# helpers
+def get_date_boundaries():
+    now_ist = datetime.now(IST)
+    today_start_ist = IST.localize(datetime(now_ist.year, now_ist.month, now_ist.day, 0,0,0))
+    today_start_utc = today_start_ist.astimezone(pytz.UTC)
+    yesterday_start_utc = today_start_utc - timedelta(days=1)
+    week_start_utc = today_start_utc - timedelta(days=now_ist.weekday())
+    return today_start_utc, yesterday_start_utc, week_start_utc, now_ist
+
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({
-        "status": "healthy",
-        "service": "GitSync Bot",
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
+    return jsonify({"status":"healthy","service":"GitSync Bot","timestamp": datetime.now(timezone.utc).isoformat()})
 
-# Add test endpoint
 @app.route('/test-db', methods=['GET'])
 def test_db():
     conn = get_db_connection()
@@ -775,7 +1095,6 @@ def test_db():
         return jsonify({"database": "connected"})
     return jsonify({"database": "disconnected"}), 500
 
-# --- SAFE INIT ON STARTUP ---
 with app.app_context():
     init_db()
 
