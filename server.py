@@ -11,7 +11,7 @@ import psycopg2
 import sys
 import html
 import traceback
-from dashboard_generator import generate_dashboard_html
+
 import json
 from collections import defaultdict
 
