@@ -27,6 +27,11 @@ load_dotenv()
 
 app = Flask(__name__)
 
+@app.route('/', methods=['GET'])
+def home():
+    # Simple health / landing for browsers and Render root
+    return "GitSync Bot Active", 200
+
 # --- CONFIG ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 TELEGRAM_BOT_TOKEN_FOR_COMMANDS = os.getenv("TELEGRAM_BOT_TOKEN_FOR_COMMANDS")
@@ -1099,4 +1104,7 @@ with app.app_context():
     init_db()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    # debug=False in production
+    app.run(host='0.0.0.0', port=port, debug=False)
